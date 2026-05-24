@@ -156,7 +156,7 @@ def send(msg):
 
 def main():
     log("ALPHA AUTO AGENT STARTED!")
-    send("🚀 Alpha Auto Agent ON!\nXAUUSD + BTCUSDT scanning har 15 min\n📢 @Alphagoldsigna")
+    send("🚀 Alpha Auto Agent ON!\nXAUUSD + BTCUSDT scanning har 5 min\n📢 @Alphagoldsigna")
     scan = 0
     while True:
         scan += 1
