@@ -18,7 +18,7 @@ import math
 # ═══════════════════════════════════════
 # ⚙️ CONFIGURATION — SIRF YAHAN CHANGE KARO
 # ═══════════════════════════════════════
-BOT_TOKEN         = "8807619711:AAEaL5HI6Bj-sbMSpliF73rxO5eRSG3zugI"
+BOT_TOKEN         = "YAHAN_NAYA_TOKEN_DALO"
 CHAT_ID           = "8867873147"
 SCAN_INTERVAL_MIN = 5
 MIN_SCORE         = 70
@@ -573,3 +573,4 @@ def build_msg(d):
 ━━━━━━━━━━━━━━━━━━━━
 {arrow} Trend  : {d['mtf_trend']}
 🪤 Setup  : {trap} @
+━━━━━━━━━━━━━━━━━━━
