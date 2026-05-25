@@ -563,14 +563,131 @@ def build_msg(d):
             f"8. Session: {d['session']['name']} — prime liquidity."
         )
 
-    return f"""{d['icon']} {sym} {d['trend']} SIGNAL {d['icon']}
-━━━━━━━━━━━━━━━━━━━━
-📍 Entry : {d['entry']}
-🛑 SL    : {d['sl_p']} (${d['sl_amt']})
-🎯 TP1   : {d['tp1']} (1:3) — Close 50%
-🎯 TP2   : {d['tp2']} (1:4) — Trail 50%
-🚀 TP3   : {d['tp3']} (1:6) — Extended
-━━━━━━━━━━━━━━━━━━━━
-{arrow} Trend  : {d['mtf_trend']}
-🪤 Setup  : {trap} @
-━━━━━━━━━━━━━━━━━━━
+    news_status = "Safe" if d['news_ok'] else "Risk"
+
+    lines = [
+        f"{d['icon']} {sym} {d['trend']} SIGNAL {d['icon']}",
+        "=" * 20,
+        f"Entry  : {d['entry']}",
+        f"SL     : {d['sl_p']} (${d['sl_amt']})",
+        f"TP1    : {d['tp1']} (1:3) - Close 50%",
+        f"TP2    : {d['tp2']} (1:4) - Trail 50%",
+        f"TP3    : {d['tp3']} (1:6) - Extended",
+        "=" * 20,
+        f"Trend  : {d['mtf_trend']}",
+        f"Setup  : {trap} @ {d['zone_nm']}",
+        f"Zone   : {d['fib382']} (38.2%)",
+        f"Swing  : {d['swing_lo']} to {d['swing_hi']}",
+        f"Volume : {d['vol_r']}x avg",
+        f"Candle : {d['body_pct']}% body",
+        f"ATR    : {d['atr']}",
+        f"Session: {d['session']['name']}",
+        f"News   : {news_status}",
+        "=" * 20,
+        "LOGIC:",
+        logic,
+        "=" * 20,
+        "CONDITIONS MET:",
+        passed,
+        "=" * 20,
+        f"Score  : {d['score']}% {stars}",
+        f"Max SL : ${d['sl_amt']} only",
+        "@Alphagoldsigna",
+        "Alpha Agent v3.0",
+    ]
+    return "\n".join(lines)
+
+# ═══════════════════════════════════════
+# SEND TELEGRAM
+# ═══════════════════════════════════════
+def send(msg):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=10)
+        d = r.json()
+        if d.get("ok"):
+            log("Signal sent to Telegram!", "SUCCESS")
+            return True
+        log(f"Telegram error: {d.get('description')}", "ERROR")
+        return False
+    except Exception as e:
+        log(f"Send error: {e}", "ERROR")
+        return False
+
+# ═══════════════════════════════════════
+# STARTUP
+# ═══════════════════════════════════════
+def startup():
+    send("""🚀 Alpha Auto Agent v3.0 LIVE!
+
+✅ XAUUSD — Gold API fixed
+✅ BTCUSDT — Binance API
+✅ MTF Trend (Daily+4H+1H)
+✅ News Filter active
+✅ Better CHOCH + Sweep
+✅ TP1 + TP2 + TP3
+
+Scan: Every 5 min
+Score threshold: 70%+
+Cooldown: 2 hours
+
+📢 @Alphagoldsigna""")
+
+# ═══════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════
+def main():
+    global scan_count, sig_count
+    log("=" * 50)
+    log("ALPHA AUTO AGENT v3.0 STARTING")
+    log("=" * 50)
+    startup()
+
+    while True:
+        scan_count += 1
+        log(f"=== SCAN #{scan_count} ===")
+
+        sess = get_session()
+        if not sess["good"]:
+            log(f"Session: {sess['name']} — Waiting for London/NY...")
+            time.sleep(SCAN_INTERVAL_MIN * 60)
+            continue
+
+        for asset_key in ASSETS:
+            try:
+                data = analyze(asset_key)
+                if not data:
+                    log(f"{asset_key} — No setup found")
+                    continue
+
+                log(f"{asset_key} | {data['trend']} | MTF:{data['mtf_trend']} | "
+                    f"Score:{data['score']}% | Price:{data['entry']} | "
+                    f"Session:{data['session']['name']}")
+
+                if data["score"] >= MIN_SCORE:
+                    now = time.time()
+                    if now - last_signal[asset_key] > COOLDOWN_HOURS * 3600:
+                        if send(build_msg(data)):
+                            last_signal[asset_key] = now
+                            sig_count += 1
+                            log(f"Signal #{sig_count} sent for {asset_key}!", "SUCCESS")
+                    else:
+                        rem = int((COOLDOWN_HOURS * 3600 - (now - last_signal[asset_key])) / 60)
+                        log(f"{asset_key} — Cooldown: {rem}min left")
+                else:
+                    failed = [c["label"] for c in data["checks"] if not c["pass"]]
+                    log(f"{asset_key} — Score {data['score']}% | Failed: {', '.join(failed[:3])}")
+
+                time.sleep(3)
+
+            except Exception as e:
+                log(f"{asset_key} error: {e}", "ERROR")
+                continue
+
+        log(f"=== Scan #{scan_count} done | Signals: {sig_count} | Next: {SCAN_INTERVAL_MIN}min ===")
+        time.sleep(SCAN_INTERVAL_MIN * 60)
+
+if __name__ == "__main__":
+    main()
