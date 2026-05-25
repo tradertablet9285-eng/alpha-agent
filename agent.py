@@ -18,7 +18,8 @@ import math
 # ═══════════════════════════════════════
 # ⚙️ CONFIGURATION — SIRF YAHAN CHANGE KARO
 # ═══════════════════════════════════════
-BOT_TOKEN         = "8807619711:AAEaL5HI6Bj-sbMSpliF73rxO5eRSG3zugI"
+BOT_TOKEN         = "8807619711:AAGahGxvq_zIKzUQLLW7r6o1gSB8D2p1Wrs"
+TWELVE_DATA_KEY   = "6df2ea47705646f2aaf14fec76fc8b8b"
 CHAT_ID           = "8867873147"
 SCAN_INTERVAL_MIN = 5
 MIN_SCORE         = 70
