@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Alpha Auto Agent v5.0
-XAUUSD (Twelve Data REAL) + BTCUSDT (Binance REAL)
-Features:
-- TP/SL hit alerts on Telegram
-- Morning + Evening market view (IST)
-- Strategy-based analysis
-- 38.2% Liquidity Sweep
-"""
+""" Alpha Auto Agent v5.0 XAUUSD (Twelve Data REAL) + BTCUSDT (Binance REAL) Features: - TP/SL hit alerts on Telegram - Morning + Evening market view (IST) - Strategy-based analysis - 38.2% Liquidity Sweep """
 
 import requests
 import time
@@ -16,7 +8,7 @@ import datetime
 # =======================================
 # CONFIGURATION
 # =======================================
-BOT_TOKEN         = "8807619711:AAEDkAn9GJDZ4J-L0PWisAh6wnLHjwxFUzc"
+BOT_TOKEN         = "8807619711:AAFDC7MG95YBZ2az448xAxJqFA1paLG7Cag"
 TWELVE_DATA_KEY   = "6df2ea47705646f2aaf14fec76fc8b8b"
 CHAT_ID           = "8867873147"
 SCAN_INTERVAL_MIN = 5
@@ -118,15 +110,57 @@ def fetch_gold(interval, limit=60):
         return None
 
 def fetch_btc(interval, limit=60):
+    # Try Binance first
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
             timeout=10)
         data = r.json()
-        return data if isinstance(data, list) and len(data) > 0 else None
+        if isinstance(data, list) and len(data) > 0:
+            log(f"BTC candles from Binance: {len(data)} ({interval})", "INFO")
+            return data
     except Exception as e:
-        log(f"Binance error: {e}", "ERROR")
+        log(f"Binance error: {e} — trying Twelve Data...", "WARN")
+
+    # Fallback: Twelve Data for BTC
+    interval_map = {
+        "5m": "5min", "15m": "15min",
+        "1h": "1h", "4h": "4h", "1d": "1day"
+    }
+    td_int = interval_map.get(interval, "5min")
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol":     "BTC/USD",
+                "interval":   td_int,
+                "outputsize": limit,
+                "apikey":     TWELVE_DATA_KEY,
+            },
+            timeout=12)
+        data = r.json()
+        if data.get("status") == "error":
+            log(f"Twelve Data BTC error: {data.get('message')}", "ERROR")
+            return None
+        values = list(reversed(data.get("values", [])))
+        if not values:
+            return None
+        candles = []
+        for v in values:
+            try:
+                ts = int(datetime.datetime.strptime(
+                    v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+            except:
+                ts = int(datetime.datetime.strptime(
+                    v["datetime"], "%Y-%m-%d").timestamp() * 1000)
+            candles.append([ts, str(v["open"]), str(v["high"]),
+                            str(v["low"]), str(v["close"]),
+                            str(v.get("volume", "1000")), ts+60000])
+        log(f"BTC candles from Twelve Data: {len(candles)} ({td_int})", "INFO")
+        return candles
+    except Exception as e:
+        log(f"Twelve Data BTC error: {e}", "ERROR")
         return None
 
 def get_candles(asset_key, interval, limit=60):
@@ -436,12 +470,62 @@ def check_tp_sl_hits():
                 log(f"{asset} TP3 HIT at {trade['tp3']}", "SUCCESS")
 
 def build_alert_msg(trade, alert_type, price):
-    sym = "XAUUSD" if trade["asset"]=="XAUUSD" else "BTCUSDT"
+    sym    = "XAUUSD" if trade["asset"]=="XAUUSD" else "BTCUSDT"
+    icon   = "\u26a1" if trade["asset"]=="XAUUSD" else "\u20bf"
+    profit = round(abs(trade["tp1"] - trade["entry"]), 2)
     alert_msgs = {
-        "TP1_HIT": f"TP1 HIT - {sym}\n\nTP1 {trade['tp1']} reached!\nClose 50% position now\nMove SL to breakeven: {trade['entry']}\n\nEntry was: {trade['entry']}\nProfit: +${round(abs(trade['tp1']-trade['entry']) * 1, 2)}\n\n@Alphagoldsigna",
-        "TP2_HIT": f"TP2 HIT - {sym}\n\nTP2 {trade['tp2']} reached!\nTrail remaining 50%\nExcellent trade!\n\nEntry was: {trade['entry']}\n\n@Alphagoldsigna",
-        "TP3_HIT": f"TP3 HIT - {sym}\n\nTP3 {trade['tp3']} reached!\nFull target achieved!\nClose remaining position\n\nEntry was: {trade['entry']}\n\n@Alphagoldsigna",
-        "SL_HIT":  f"SL HIT - {sym}\n\nSL {trade['sl_p']} hit at {price}\nMax loss: ${trade['sl_amt']}\nPart of trading - next setup coming!\n\nEntry was: {trade['entry']}\n\n@Alphagoldsigna",
+        "TP1_HIT": "\n".join([
+            f"{icon} {sym} TP1 HIT! \U0001f3af",
+            "\u2501"*22,
+            f"\U0001f4cd Entry : {trade['entry']}",
+            f"\U0001f3af TP1 : {trade['tp1']} HIT!",
+            f"\U0001f4b0 Profit : +${profit}",
+            "\u2501"*22,
+            "\u2705 ACTION: Close 50% position NOW!",
+            f"\U0001f6e1 Move SL to breakeven: {trade['entry']}",
+            f"\U0001f3af TP2 target: {trade['tp2']}",
+            f"\U0001f680 TP3 target: {trade['tp3']}",
+            "\u2501"*22,
+            "Excellent trade! Keep trailing! \U0001f525",
+            "@Alphagoldsigna",
+        ]),
+        "TP2_HIT": "\n".join([
+            f"{icon} {sym} TP2 HIT! \U0001f929",
+            "\u2501"*22,
+            f"\U0001f4cd Entry : {trade['entry']}",
+            f"\U0001f3af TP2 : {trade['tp2']} HIT!",
+            "\u2501"*22,
+            "\u2705 ACTION: Trail remaining 50%!",
+            f"\U0001f680 TP3 still open: {trade['tp3']}",
+            "\u2501"*22,
+            "Amazing trade! \U0001f911",
+            "@Alphagoldsigna",
+        ]),
+        "TP3_HIT": "\n".join([
+            f"{icon} {sym} TP3 HIT! \U0001f3c6",
+            "\u2501"*22,
+            f"\U0001f4cd Entry : {trade['entry']}",
+            f"\U0001f680 TP3 : {trade['tp3']} HIT!",
+            "\u2501"*22,
+            "\u2705 ACTION: Close full position!",
+            "FULL TARGET ACHIEVED! \U0001f525\U0001f525\U0001f525",
+            "\u2501"*22,
+            "Perfect trade! \U0001f3c6\U0001f4aa",
+            "@Alphagoldsigna",
+        ]),
+        "SL_HIT": "\n".join([
+            f"{icon} {sym} SL HIT \U0001f6d1",
+            "\u2501"*22,
+            f"\U0001f4cd Entry : {trade['entry']}",
+            f"\U0001f6d1 SL : {trade['sl_p']} hit @ {price}",
+            f"\U0001f4b8 Loss : -${trade['sl_amt']} (controlled)",
+            "\u2501"*22,
+            "\u26a0 Part of trading! Stay disciplined!",
+            "Next setup coming soon! \U0001f4aa",
+            "Risk was managed! \u2705",
+            "\u2501"*22,
+            "@Alphagoldsigna",
+        ]),
     }
     return alert_msgs.get(alert_type, "Alert")
 
@@ -454,93 +538,89 @@ def build_market_view(time_of_day):
     ist_time = (datetime.datetime.utcnow() +
                 datetime.timedelta(hours=5, minutes=30)).strftime("%I:%M %p")
 
-    header = "GOOD MORNING" if time_of_day == "morning" else "GOOD EVENING"
-    lines.append(f"{header} - Market View")
-    lines.append(f"Time: {ist_time} IST")
-    lines.append("=" * 25)
+    if time_of_day == "morning":
+        header = "\U0001f31e Good Morning Traders!"
+        sub    = "\U0001f4ca Daily Market Analysis"
+    else:
+        header = "\U0001f307 Good Evening Traders!"
+        sub    = "\U0001f4ca Evening Market Update"
+
+    lines.append(header)
+    lines.append(sub)
+    lines.append(f"\U0001f550 Time: {ist_time} IST")
+    lines.append("\u2501"*22)
 
     for asset_key in ASSETS:
         sym  = "XAUUSD" if asset_key=="XAUUSD" else "BTCUSDT"
+        icon = "\u26a1" if asset_key=="XAUUSD" else "\u20bf"
         c1h  = get_candles(asset_key, "1h", 60)
-        c4h  = get_candles(asset_key, "4h", 30)
-        c1d  = get_candles(asset_key, "1d", 10)
 
         if not c1h:
-            lines.append(f"\n{sym}: Data unavailable")
+            lines.append(f"\n{icon} {sym}: Data unavailable \u26a0")
             continue
 
-        # Current price
         price = float(c1h[-1][4])
-
-        # MTF Trend
         mtf_trend, mtf_s = get_mtf_trend(asset_key)
 
-        # Fib levels
-        highs = [float(c[2]) for c in c1h[-20:]]
-        lows  = [float(c[3]) for c in c1h[-20:]]
+        highs  = [float(c[2]) for c in c1h[-20:]]
+        lows   = [float(c[3]) for c in c1h[-20:]]
         sh, sl = max(highs), min(lows)
-        rng   = sh - sl
+        rng    = sh - sl
         fib382 = sh - rng*0.382
         fib236 = sh - rng*0.236
 
-        # EMA
-        closes = [float(c[4]) for c in c1h]
-        ema20  = calc_ema(closes, 20) or price
-        ema50  = calc_ema(closes, 50) or price
-
-        # ATR
+        closes  = [float(c[4]) for c in c1h]
+        ema20   = calc_ema(closes, 20) or price
+        ema50   = calc_ema(closes, 50) or price
         atr_val = calc_atr(c1h, 14) or 1
 
-        # Price vs EMA
-        above_ema = price > ema20
-
-        # Session
-        sess = get_session()
-
-        # Direction bias
         if "STRONG_BUY" in mtf_trend:
-            bias     = "STRONG BULLISH"
-            strategy = "Look for BUY setups at 38.2% zone"
-            action   = "Buy dips, especially at " + str(round(fib382, 2))
+            bias_icon = "\U0001f4c8\U0001f4c8"
+            bias      = "STRONG BULLISH"
+            action    = f"Buy dips at {round(fib382, 2)}"
+            do        = "\U0001f7e2 BUY BIAS - Look for BUY setups"
         elif "BUY" in mtf_trend:
-            bias     = "BULLISH"
-            strategy = "Prefer BUY setups"
-            action   = "Buy on pullback to " + str(round(fib382, 2))
+            bias_icon = "\U0001f4c8"
+            bias      = "BULLISH"
+            action    = f"Buy pullback to {round(fib382, 2)}"
+            do        = "\U0001f7e2 BUY BIAS - Prefer BUY setups"
         elif "STRONG_SELL" in mtf_trend:
-            bias     = "STRONG BEARISH"
-            strategy = "Look for SELL setups at 38.2% zone"
-            action   = "Sell rallies, especially at " + str(round(fib382, 2))
+            bias_icon = "\U0001f4c9\U0001f4c9"
+            bias      = "STRONG BEARISH"
+            action    = f"Sell rally at {round(fib382, 2)}"
+            do        = "\U0001f534 SELL BIAS - Look for SELL setups"
         elif "SELL" in mtf_trend:
-            bias     = "BEARISH"
-            strategy = "Prefer SELL setups"
-            action   = "Sell on rally to " + str(round(fib382, 2))
+            bias_icon = "\U0001f4c9"
+            bias      = "BEARISH"
+            action    = f"Sell rally to {round(fib382, 2)}"
+            do        = "\U0001f534 SELL BIAS - Prefer SELL setups"
         else:
-            bias     = "NEUTRAL"
-            strategy = "Wait for clear direction"
-            action   = "No trade - sideways market"
+            bias_icon = "\u23f8"
+            bias      = "NEUTRAL"
+            action    = "Wait for clear direction"
+            do        = "\U0001f7e1 NEUTRAL - No trade now"
 
-        lines.append(f"\n{sym} Analysis")
-        lines.append("-" * 20)
-        lines.append(f"Price    : {price}")
-        lines.append(f"Trend    : {bias}")
-        lines.append(f"EMA 20   : {round(ema20, 2)}")
-        lines.append(f"EMA 50   : {round(ema50, 2)}")
-        lines.append(f"38.2% Zone: {round(fib382, 2)}")
-        lines.append(f"23.6% Zone: {round(fib236, 2)}")
-        lines.append(f"ATR      : {round(atr_val, 2)}")
-        lines.append(f"Strategy : {strategy}")
-        lines.append(f"Action   : {action}")
+        lines.append(f"\n{icon} {sym} Analysis {bias_icon}")
+        lines.append("\u2500"*22)
+        lines.append(f"\U0001f4b0 Price : {price}")
+        lines.append(f"\U0001f4ca Trend : {bias}")
+        lines.append(f"\U0001f4cf EMA 20 : {round(ema20, 2)}")
+        lines.append(f"\U0001f4cf EMA 50 : {round(ema50, 2)}")
+        lines.append(f"\U0001f3af 38.2% Zone: {round(fib382, 2)}")
+        lines.append(f"\U0001f3af 23.6% Zone: {round(fib236, 2)}")
+        lines.append(f"\U0001f6e1 Support : {round(sl, 2)}")
+        lines.append(f"\u26a0 Resistance: {round(sh, 2)}")
+        lines.append(f"\U0001f4e1 ATR : {round(atr_val, 2)}")
+        lines.append(f"\u2714 {do}")
+        lines.append(f"\U0001f4cc Action : {action}")
 
-        # Key levels
-        lines.append(f"Support  : {round(sl, 2)}")
-        lines.append(f"Resistance: {round(sh, 2)}")
-
-    lines.append("\n" + "=" * 25)
-    lines.append("Strategy: 38.2% Liquidity Sweep")
-    lines.append("Wait for sweep + confirmation")
-    lines.append("Min Score: 70% for entry")
-    lines.append("@Alphagoldsigna")
-    lines.append("Alpha Agent v5.0")
+    lines.append("\n" + "\u2501"*22)
+    lines.append("\U0001f9e0 Strategy: 38.2% Liquidity Sweep")
+    lines.append("\u23f3 Wait for sweep + confirmation")
+    lines.append("\U0001f4af Min Score: 70%+ for entry")
+    lines.append("\u26a0 Always confirm on your chart!")
+    lines.append("\U0001f4e2 @Alphagoldsigna")
+    lines.append("\U0001f916 Alpha Agent v5.0")
     return "\n".join(lines)
 
 def check_and_send_market_view():
@@ -577,66 +657,72 @@ def check_and_send_market_view():
 # BUILD SIGNAL MESSAGE
 # =======================================
 def build_msg(d):
-    stars = "***" if d["score"]>=85 else "**" if d["score"]>=70 else "*"
-    trap  = "Sellers Trap" if d["trend"]=="BUY" else "Buyers Trap"
-    sym   = "XAUUSD" if d["asset"]=="XAUUSD" else "BTCUSDT"
-    news  = "Safe" if d["news_ok"] else "Risk"
-    passed = "\n".join("  OK " + c["label"] for c in d["checks"] if c["pass"])
+    stars  = "\u2b50\u2b50\u2b50" if d["score"]>=85 else "\u2b50\u2b50" if d["score"]>=70 else "\u2b50"
+    trap   = "Seller's Trap \U0001f43b" if d["trend"]=="BUY" else "Buyer's Trap \U0001f403"
+    sym    = "XAUUSD" if d["asset"]=="XAUUSD" else "BTCUSDT"
+    icon   = "\u26a1" if d["asset"]=="XAUUSD" else "\u20bf"
+    news   = "\u2705 Safe" if d["news_ok"] else "\u26a0 Risk"
+    passed = "\n".join(" \u2705 " + c["label"] for c in d["checks"] if c["pass"])
+    sig_icon = "\U0001f7e2\u2b06" if d["trend"]=="BUY" else "\U0001f534\u2b07"
+    conf   = "HIGH \U0001f525" if d["score"]>=85 else "GOOD \u26a1" if d["score"]>=70 else "LOW \u26a0"
 
     if d["trend"] == "BUY":
         logic = "\n".join([
-            f"1. {d['mtf_trend']} trend Daily+4H+1H confirmed.",
-            f"2. 1H sharp bullish impulse. Fib zone: {d['fib382']}.",
-            f"3. Sellers swept liquidity below zone ({trap})!",
-            f"4. Smart money trapped sellers - buying started.",
-            f"5. CHOCH: {d['choch_det']}",
-            f"6. Strong {d['body_pct']}% body candle above EMA {d['ema20']}.",
-            f"7. Volume {d['vol_r']}x spike - institutional buying.",
-            f"8. Session: {d['session']['name']} - prime time.",
+            f"\U0001f4ca {d['mtf_trend']} trend Daily+4H+1H confirmed.",
+            f"\U0001f4c8 1H sharp bullish impulse. Fib zone: {d['fib382']}.",
+            f"\U0001f43b Sellers swept liquidity BELOW zone!",
+            f"\U0001f3e6 Smart money trapped sellers - BUY started.",
+            f"\U0001f504 CHOCH: {d['choch_det']}",
+            f"\U0001f55f Strong {d['body_pct']}% body candle above EMA {d['ema20']}.",
+            f"\U0001f4a5 Volume {d['vol_r']}x spike = Institutional buying!",
+            f"\u23f0 Session: {d['session']['name']} = Prime time!",
         ])
     else:
         logic = "\n".join([
-            f"1. {d['mtf_trend']} trend Daily+4H+1H confirmed.",
-            f"2. 1H sharp bearish impulse. Fib zone: {d['fib382']}.",
-            f"3. Buyers swept liquidity above zone ({trap})!",
-            f"4. Smart money trapped buyers - selling started.",
-            f"5. CHOCH: {d['choch_det']}",
-            f"6. Strong {d['body_pct']}% body candle below EMA {d['ema20']}.",
-            f"7. Volume {d['vol_r']}x spike - institutional selling.",
-            f"8. Session: {d['session']['name']} - prime time.",
+            f"\U0001f4ca {d['mtf_trend']} trend Daily+4H+1H confirmed.",
+            f"\U0001f4c9 1H sharp bearish impulse. Fib zone: {d['fib382']}.",
+            f"\U0001f403 Buyers swept liquidity ABOVE zone!",
+            f"\U0001f3e6 Smart money trapped buyers - SELL started.",
+            f"\U0001f504 CHOCH: {d['choch_det']}",
+            f"\U0001f55f Strong {d['body_pct']}% body candle below EMA {d['ema20']}.",
+            f"\U0001f4a5 Volume {d['vol_r']}x spike = Institutional selling!",
+            f"\u23f0 Session: {d['session']['name']} = Prime time!",
         ])
 
     lines = [
-        f"{sym} {d['trend']} SIGNAL {stars}",
-        "=" * 22,
-        f"Entry   : {d['entry']}",
-        f"SL      : {d['sl_p']} (${d['sl_amt']})",
-        f"TP1     : {d['tp1']} (1:3) Close 50%",
-        f"TP2     : {d['tp2']} (1:4) Trail 50%",
-        f"TP3     : {d['tp3']} (1:6) Extended",
-        "=" * 22,
-        f"Trend   : {d['mtf_trend']}",
-        f"Setup   : {trap} @ {d['zone_nm']}",
-        f"Zone    : {d['fib382']}",
-        f"Swing   : {d['sl_level']} to {d['sh']}",
-        f"Volume  : {d['vol_r']}x avg",
-        f"Candle  : {d['body_pct']}% body",
-        f"ATR     : {d['atr']}",
-        f"Session : {d['session']['name']}",
-        f"News    : {news}",
-        "=" * 22,
-        "TRADE LOGIC:",
+        f"{icon} {sym} {d['trend']} SIGNAL {sig_icon}",
+        f"{'='*24}",
+        f"\U0001f4cd Entry : {d['entry']}",
+        f"\U0001f6d1 SL : {d['sl_p']} (Max ${d['sl_amt']})",
+        f"\U0001f3af TP1 : {d['tp1']} (1:3) \u2192 Close 50%",
+        f"\U0001f3af TP2 : {d['tp2']} (1:4) \u2192 Trail 50%",
+        f"\U0001f680 TP3 : {d['tp3']} (1:6) \u2192 Extended",
+        f"{'='*24}",
+        f"\U0001f4ca Trend : {d['mtf_trend']}",
+        f"\U0001f9f2 Setup : {trap}",
+        f"\U0001f4d0 Zone : {d['fib382']} ({d['zone_nm']})",
+        f"\U0001f4cf Swing : {d['sl_level']} \u2192 {d['sh']}",
+        f"\U0001f4b9 EMA 20 : {d['ema20']}",
+        f"\U0001f4a5 Volume : {d['vol_r']}x avg",
+        f"\U0001f55f Candle : {d['body_pct']}% body",
+        f"\U0001f4e1 ATR : {d['atr']}",
+        f"\u23f0 Session : {d['session']['name']}",
+        f"\U0001f4f0 News : {news}",
+        f"{'='*24}",
+        f"\U0001f4cb TRADE LOGIC:",
         logic,
-        "=" * 22,
-        "CONDITIONS MET:",
+        f"{'='*24}",
+        f"\u2705 CONDITIONS MET:",
         passed,
-        "=" * 22,
-        f"Score   : {d['score']}% {stars}",
-        f"Max SL  : ${d['sl_amt']} only",
-        "TP1 hit = Close 50% + Move SL to entry",
-        "TP2 hit = Trail remaining 50%",
-        "@Alphagoldsigna",
-        "Alpha Agent v5.0",
+        f"{'='*24}",
+        f"\U0001f4af Score : {d['score']}% {stars}",
+        f"\U0001f4aa Confidence: {conf}",
+        f"\u26a0 Max SL : ${d['sl_amt']} only!",
+        f"\U0001f4cc TP1 hit \u2192 Close 50% + Move SL to entry",
+        f"\U0001f4cc TP2 hit \u2192 Trail remaining 50%",
+        f"{'='*24}",
+        f"\U0001f4e2 @Alphagoldsigna",
+        f"\U0001f916 Alpha Agent v5.0",
     ]
     return "\n".join(lines)
 
@@ -664,22 +750,24 @@ def send(msg):
 # =======================================
 def startup():
     send("\n".join([
-        "Alpha Auto Agent v5.0 LIVE!",
+        "\U0001f916 Alpha Auto Agent v5.0 LIVE! \U0001f680",
         "",
-        "NEW FEATURES:",
-        "- XAUUSD Real Candles (Twelve Data)",
-        "- BTCUSDT Real Candles (Binance)",
-        "- TP1/TP2/TP3 Hit Alerts",
-        "- SL Hit Alert",
-        "- Morning View 9:00 AM IST",
-        "- Evening View 6:00 PM IST",
-        "- MTF Trend Daily+4H+1H",
-        "- News Filter",
+        "\u2705 XAUUSD - Twelve Data (Real candles)",
+        "\u2705 BTCUSDT - Binance + Twelve Data",
+        "\u2705 MTF Trend Daily+4H+1H",
+        "\u2705 38.2% Liquidity Sweep",
+        "\u2705 TP1/TP2/TP3 + SL Alerts",
+        "\u2705 Morning View 9:00 AM IST",
+        "\u2705 Evening View 6:00 PM IST",
+        "\u2705 News Filter (ForexFactory)",
+        "\u2705 Session Filter (London/NY)",
         "",
-        "Scan: Every 5 min",
-        "Min Score: 70%",
+        "\u23f1 Scan: Every 5 minutes",
+        "\U0001f4af Min Score: 70%+",
+        "\u23f0 Cooldown: 2 hours",
         "",
-        "@Alphagoldsigna",
+        "\U0001f4e2 @Alphagoldsigna",
+        "Let's make money! \U0001f4b0\U0001f525",
     ]))
 
 # =======================================
