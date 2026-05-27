@@ -9,7 +9,7 @@ import datetime
 # CONFIGURATION
 # =======================================
 BOT_TOKEN         = "8807619711:AAF3CbJXt9y-37baTX9xDOmXQwCHx6_qxWw"
-TWELVE_DATA_KEY   = "6df2ea47705646f2aaf14fec76fc8b8b"
+TWELVE_DATA_KEY   = "0097319bd8aa368070165fb04b04d6fe"
 CHAT_ID           = "8867873147"
 SCAN_INTERVAL_MIN = 5
 MIN_SCORE         = 70
