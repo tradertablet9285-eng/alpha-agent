@@ -12,7 +12,7 @@ BOT_TOKEN         = "8807619711:AAF3CbJXt9y-37baTX9xDOmXQwCHx6_qxWw"
 TWELVE_DATA_KEY   = "6df2ea47705646f2aaf14fec76fc8b8b"
 CHAT_ID           = "8867873147"
 SCAN_INTERVAL_MIN = 15
-MIN_SCORE         = 65
+MIN_SCORE         = 70
 COOLDOWN_HOURS    = 2
 
 # Morning view IST = 09:00 = 03:30 GMT
