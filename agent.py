@@ -22,7 +22,7 @@ import datetime
 BOT_TOKEN         = "8978957779:AAF8fNhxiaQw1VcNvMOnMClPd2alqVRjL1c"
 TWELVE_DATA_KEY   = "6df2ea47705646f2aaf14fec76fc8b8b"
 CHAT_ID           = "8867873147"
-MIN_SCORE         = 60
+MIN_SCORE         = 70
 COOLDOWN_HOURS    = 2
 
 # Schedule (all IST times)
