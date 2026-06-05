@@ -20,7 +20,7 @@ import datetime
 # =======================================
 BOT_TOKEN      = "8978957779:AAF8fNhxiaQw1VcNvMOnMClPd2alqVRjL1c"
 CHAT_ID        = "8867873147"
-MIN_SCORE      = 60
+MIN_SCORE      = 70
 COOLDOWN_HOURS = 2
 # =======================================
 
