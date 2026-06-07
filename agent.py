@@ -19,7 +19,7 @@ import datetime
 BOT_TOKEN        = "8978957779:AAF8fNhxiaQw1VcNvMOnMClPd2alqVRjL1c"
 TWELVE_DATA_KEY  = "6df2ea47705646f2aaf14fec76fc8b8b"
 CHAT_ID          = "8867873147"
-MIN_SCORE        = 60
+MIN_SCORE        = 70
 COOLDOWN_HOURS   = 2
 # =======================================
 
@@ -1005,7 +1005,7 @@ def startup():
         "\U0001f4ca Sunday 8PM - Weekly Report",
         "\U0001f4ca 1st Month  - Monthly Report",
         "",
-        "\U0001f3af Min Score: 60%+",
+        "\U0001f3af Min Score: 70%+",
         "\u23f0 Cooldown: 2hr per asset",
         "\U0001f4e2 @Alphagoldsigna",
         "Let's go! \U0001f4b0\U0001f525",
