@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Alpha Auto Agent v5.0
-XAUUSD (Twelve Data REAL) + BTCUSDT (Binance REAL)
-Features:
-- TP/SL hit alerts on Telegram
-- Morning + Evening market view (IST)
-- Strategy-based analysis
-- 38.2% Liquidity Sweep
+Alpha Auto Agent v5.1 - FIXED API CALLS
+XAUUSD: Twelve Data (max 4 calls/min, cached)
+BTCUSDT: Binance + fallbacks
+Schedule based IST + TP/SL alerts
+Morning 9AM + Evening 6PM views
+Prime time 12:30PM-10:30PM har 15min scan
 """
 
 import requests
@@ -16,176 +15,323 @@ import datetime
 # =======================================
 # CONFIGURATION
 # =======================================
-BOT_TOKEN         = "8978957779:AAF8fNhxiaQw1VcNvMOnMClPd2alqVRjL1c"
-TWELVE_DATA_KEY   = "6df2ea47705646f2aaf14fec76fc8b8b"
-CHAT_ID           = "8867873147"
-SCAN_INTERVAL_MIN = 5
-MIN_SCORE         = 70
-COOLDOWN_HOURS    = 2
-
-# Morning view IST = 09:00 = 03:30 GMT
-# Evening view IST = 18:00 = 12:30 GMT
-MORNING_VIEW_HOUR_GMT = 3
-MORNING_VIEW_MIN_GMT  = 30
-EVENING_VIEW_HOUR_GMT = 12
-EVENING_VIEW_MIN_GMT  = 30
+BOT_TOKEN       = "YAHAN_NAYA_TOKEN_DALO"
+TWELVE_DATA_KEY = "YAHAN_TWELVE_DATA_KEY_DALO"
+CHAT_ID         = "8867873147"
+MIN_SCORE       = 60
+COOLDOWN_HOURS  = 2
 # =======================================
 
 ASSETS = {
-    "XAUUSD": {"sl": 6.5,  "vol_min": 2.0, "is_gold": True},
-    "BTCUSD": {"sl": 175,  "vol_min": 3.0, "is_gold": False, "sym": "BTCUSDT"},
+    "XAUUSD": {"sl": 6.5,  "vol_min": 1.5},
+    "BTCUSD": {"sl": 175,  "vol_min": 2.0},
 }
 
-last_signal      = {"XAUUSD": 0, "BTCUSD": 0}
-active_trades    = {}
-scan_count       = 0
-sig_count        = 0
-morning_sent     = False
-evening_sent     = False
-last_view_date   = None
-weekly_report_sent  = False
-monthly_report_sent = False
-last_week_num       = None
-last_month_num      = None
-signal_history      = []
+last_signal    = {"XAUUSD": 0, "BTCUSD": 0}
+sig_count      = 0
+sent_today     = {}
+last_date      = None
+last_scan_time = 0
+signal_history = []
+active_trades  = {}
+
+# Cache â€” Gold 55min, BTC 14min
+_gold_cache      = None
+_gold_cache_time = 0
+_btc_cache       = None
+_btc_cache_time  = 0
 
 # =======================================
 # LOGGING
 # =======================================
 def log(msg, level="INFO"):
     t = datetime.datetime.utcnow().strftime("%H:%M:%S")
-    print(f"[{t} GMT] [{level}] {msg}")
+    print("[" + t + " GMT] [" + level + "] " + str(msg))
 
 # =======================================
-# SESSION
+# TIME HELPERS
 # =======================================
+def get_ist():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+
 def get_session():
     now = datetime.datetime.utcnow()
     h   = now.hour + now.minute / 60
     day = now.weekday()
-    if day >= 5:
-        return {"name": "Weekend",           "good": False}
-    if 0  <= h <  7:
-        return {"name": "Asian",             "good": False}
-    if 7  <= h < 10:
-        return {"name": "London Open",       "good": True}
-    if 10 <= h < 12:
-        return {"name": "London Mid",        "good": True}
-    if 12 <= h < 15:
-        return {"name": "London-NY Overlap", "good": True}
-    if 15 <= h < 17:
-        return {"name": "NY Open",           "good": True}
-    if 17 <= h < 20:
-        return {"name": "NY Mid",            "good": day != 4}
-    return {"name": "Closed",                "good": False}
+    if day >= 5:  return {"name": "Weekend",           "good": False}
+    if h < 7:     return {"name": "Asian",             "good": False}
+    if h < 10:    return {"name": "London Open",       "good": True}
+    if h < 12:    return {"name": "London Mid",        "good": True}
+    if h < 15:    return {"name": "London-NY Overlap", "good": True}
+    if h < 17:    return {"name": "NY Open",           "good": True}
+    if h < 20:    return {"name": "NY Mid",            "good": day != 4}
+    return {"name": "Closed", "good": False}
+
+def is_prime_time():
+    ist = get_ist()
+    h, m = ist.hour, ist.minute
+    if ist.weekday() >= 5: return False
+    after  = (h == 12 and m >= 30) or h >= 13
+    before = h < 22 or (h == 22 and m <= 30)
+    return after and before
+
+def reset_daily():
+    global sent_today, last_date
+    today = get_ist().date()
+    if last_date != today:
+        sent_today = {}
+        last_date  = today
+        log("Daily reset - " + str(today))
 
 # =======================================
-# FETCH CANDLES
+# FETCH GOLD
+# Max 1 API call per 55 min = safe!
 # =======================================
-def fetch_gold(interval, limit=60):
-    interval_map = {
-        "5m": "5min", "15m": "15min",
-        "1h": "1h",   "4h": "4h",   "1d": "1day"
-    }
-    td_int = interval_map.get(interval, "5min")
+def fetch_gold(limit=60):
+    global _gold_cache, _gold_cache_time
+    now_t = time.time()
+
+    # Return cache if fresh (55 min)
+    if _gold_cache and (now_t - _gold_cache_time) < 55 * 60:
+        age = int((now_t - _gold_cache_time) / 60)
+        log("Gold cache " + str(age) + "min | $" + str(float(_gold_cache[-1][4])))
+        return _gold_cache[-limit:]
+
+    log("Fetching fresh Gold data...")
+
+    # Source 1: Twelve Data XAU/USD
     try:
         r = requests.get(
             "https://api.twelvedata.com/time_series",
-            params={
-                "symbol":     "XAU/USD",
-                "interval":   td_int,
-                "outputsize": limit,
-                "apikey":     TWELVE_DATA_KEY,
-            },
-            timeout=12)
+            params={"symbol": "XAU/USD", "interval": "1h",
+                    "outputsize": limit, "apikey": TWELVE_DATA_KEY},
+            timeout=15)
         data = r.json()
-        if data.get("status") == "error":
-            log(f"Twelve Data: {data.get('message')}", "ERROR")
-            return None
-        values = list(reversed(data.get("values", [])))
-        if not values:
-            return None
-        candles = []
-        for v in values:
-            try:
-                ts = int(datetime.datetime.strptime(
-                    v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
-            except:
-                ts = int(datetime.datetime.strptime(
-                    v["datetime"], "%Y-%m-%d").timestamp() * 1000)
-            candles.append([ts, str(v["open"]), str(v["high"]),
-                            str(v["low"]), str(v["close"]),
-                            str(v.get("volume", "1000")), ts+60000])
-        log(f"Gold candles: {len(candles)} ({td_int})", "INFO")
-        return candles
+        if data.get("status") != "error":
+            values = list(reversed(data.get("values", [])))
+            if len(values) >= 10:
+                candles = []
+                for v in values:
+                    try:
+                        ts = int(datetime.datetime.strptime(
+                            v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+                    except:
+                        ts = int(datetime.datetime.strptime(
+                            v["datetime"], "%Y-%m-%d").timestamp() * 1000)
+                    candles.append([ts, str(v["open"]), str(v["high"]),
+                                    str(v["low"]), str(v["close"]),
+                                    str(v.get("volume", "1000")), ts + 3600000])
+                price = float(candles[-1][4])
+                log("Gold Twelve Data: " + str(len(candles)) + " candles | $" + str(price))
+                _gold_cache = candles
+                _gold_cache_time = now_t
+                return candles[-limit:]
+        else:
+            log("Twelve Data Gold: " + str(data.get("message", ""))[:60], "WARN")
     except Exception as e:
-        log(f"Twelve Data error: {e}", "ERROR")
-        return None
+        log("Twelve Data Gold error: " + str(e), "WARN")
 
-def fetch_btc(interval, limit=60):
-    # Try Binance first
+    # Source 2: Yahoo XAUUSD=X
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 Chrome/91.0"}
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X",
+            params={"interval": "1h", "range": "7d"},
+            headers=headers, timeout=15)
+        data   = r.json()
+        result = data["chart"]["result"][0]
+        ts_list= result["timestamp"]
+        q      = result["indicators"]["quote"][0]
+        candles = []
+        for i in range(len(ts_list)):
+            o = q["open"][i]; hh = q["high"][i]
+            l = q["low"][i];  c  = q["close"][i]
+            v = q.get("volume", [1000] * len(ts_list))[i]
+            if None in (o, hh, l, c): continue
+            t_ms = int(ts_list[i]) * 1000
+            candles.append([t_ms,
+                str(round(float(o), 2)), str(round(float(hh), 2)),
+                str(round(float(l), 2)), str(round(float(c), 2)),
+                str(int(v) if v else 1000), t_ms + 3600000])
+        if len(candles) >= 10:
+            price = float(candles[-1][4])
+            log("Gold Yahoo XAUUSD=X: " + str(len(candles)) + " | $" + str(price))
+            _gold_cache = candles
+            _gold_cache_time = now_t
+            return candles[-limit:]
+    except Exception as e:
+        log("Yahoo XAUUSD=X error: " + str(e), "WARN")
+
+    # Source 3: Yahoo GC=F
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 Chrome/91.0"}
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F",
+            params={"interval": "1h", "range": "7d"},
+            headers=headers, timeout=15)
+        data   = r.json()
+        result = data["chart"]["result"][0]
+        ts_list= result["timestamp"]
+        q      = result["indicators"]["quote"][0]
+        candles = []
+        for i in range(len(ts_list)):
+            o = q["open"][i]; hh = q["high"][i]
+            l = q["low"][i];  c  = q["close"][i]
+            v = q.get("volume", [1000] * len(ts_list))[i]
+            if None in (o, hh, l, c): continue
+            t_ms = int(ts_list[i]) * 1000
+            candles.append([t_ms,
+                str(round(float(o), 2)), str(round(float(hh), 2)),
+                str(round(float(l), 2)), str(round(float(c), 2)),
+                str(int(v) if v else 1000), t_ms + 3600000])
+        if len(candles) >= 10:
+            price = float(candles[-1][4])
+            log("Gold Yahoo GC=F: " + str(len(candles)) + " | $" + str(price))
+            _gold_cache = candles
+            _gold_cache_time = now_t
+            return candles[-limit:]
+    except Exception as e:
+        log("Yahoo GC=F error: " + str(e), "WARN")
+
+    if _gold_cache:
+        log("Gold using old cache", "WARN")
+        return _gold_cache[-limit:]
+
+    log("Gold fetch FAILED!", "ERROR")
+    return None
+
+# =======================================
+# FETCH BTC
+# Max 1 API call per 14 min = safe!
+# =======================================
+def fetch_btc(limit=60):
+    global _btc_cache, _btc_cache_time
+    now_t = time.time()
+
+    if _btc_cache and (now_t - _btc_cache_time) < 14 * 60:
+        age = int((now_t - _btc_cache_time) / 60)
+        log("BTC cache " + str(age) + "min | $" + str(float(_btc_cache[-1][4])))
+        return _btc_cache
+
+    log("Fetching fresh BTC data...")
+
+    # Source 1: Binance
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
+            params={"symbol": "BTCUSDT", "interval": "1h", "limit": limit},
             timeout=10)
         data = r.json()
         if isinstance(data, list) and len(data) > 0:
-            log(f"BTC candles from Binance: {len(data)} ({interval})", "INFO")
+            price = float(data[-1][4])
+            log("BTC Binance: " + str(len(data)) + " | $" + str(price))
+            _btc_cache = data
+            _btc_cache_time = now_t
             return data
     except Exception as e:
-        log(f"Binance error: {e} â€” trying Twelve Data...", "WARN")
+        log("Binance error: " + str(e), "WARN")
 
-    # Fallback: Twelve Data for BTC
-    interval_map = {
-        "5m": "5min", "15m": "15min",
-        "1h": "1h", "4h": "4h", "1d": "1day"
-    }
-    td_int = interval_map.get(interval, "5min")
+    # Source 2: Bybit
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "linear", "symbol": "BTCUSDT",
+                    "interval": "60", "limit": limit},
+            timeout=10)
+        data = r.json()
+        if data.get("retCode") == 0:
+            items = list(reversed(data["result"]["list"]))
+            candles = []
+            for item in items:
+                candles.append([int(item[0]), item[1], item[2],
+                                item[3], item[4], item[5], int(item[0]) + 3600000])
+            if candles:
+                price = float(candles[-1][4])
+                log("BTC Bybit: " + str(len(candles)) + " | $" + str(price))
+                _btc_cache = candles
+                _btc_cache_time = now_t
+                return candles
+    except Exception as e:
+        log("Bybit error: " + str(e), "WARN")
+
+    # Source 3: Yahoo BTC-USD
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 Chrome/91.0"}
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/BTC-USD",
+            params={"interval": "1h", "range": "7d"},
+            headers=headers, timeout=15)
+        data   = r.json()
+        result = data["chart"]["result"][0]
+        ts_list= result["timestamp"]
+        q      = result["indicators"]["quote"][0]
+        candles = []
+        for i in range(len(ts_list)):
+            o = q["open"][i]; hh = q["high"][i]
+            l = q["low"][i];  c  = q["close"][i]
+            v = q.get("volume", [1000] * len(ts_list))[i]
+            if None in (o, hh, l, c): continue
+            t_ms = int(ts_list[i]) * 1000
+            candles.append([t_ms,
+                str(round(float(o), 2)), str(round(float(hh), 2)),
+                str(round(float(l), 2)), str(round(float(c), 2)),
+                str(int(v) if v else 1000), t_ms + 3600000])
+        if len(candles) >= 10:
+            price = float(candles[-1][4])
+            log("BTC Yahoo: " + str(len(candles)) + " | $" + str(price))
+            _btc_cache = candles
+            _btc_cache_time = now_t
+            return candles
+    except Exception as e:
+        log("Yahoo BTC error: " + str(e), "WARN")
+
+    # Source 4: Twelve Data BTC/USD
     try:
         r = requests.get(
             "https://api.twelvedata.com/time_series",
-            params={
-                "symbol":     "BTC/USD",
-                "interval":   td_int,
-                "outputsize": limit,
-                "apikey":     TWELVE_DATA_KEY,
-            },
-            timeout=12)
+            params={"symbol": "BTC/USD", "interval": "1h",
+                    "outputsize": limit, "apikey": TWELVE_DATA_KEY},
+            timeout=15)
         data = r.json()
-        if data.get("status") == "error":
-            log(f"Twelve Data BTC error: {data.get('message')}", "ERROR")
-            return None
-        values = list(reversed(data.get("values", [])))
-        if not values:
-            return None
-        candles = []
-        for v in values:
-            try:
-                ts = int(datetime.datetime.strptime(
-                    v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
-            except:
-                ts = int(datetime.datetime.strptime(
-                    v["datetime"], "%Y-%m-%d").timestamp() * 1000)
-            candles.append([ts, str(v["open"]), str(v["high"]),
-                            str(v["low"]), str(v["close"]),
-                            str(v.get("volume", "1000")), ts+60000])
-        log(f"BTC candles from Twelve Data: {len(candles)} ({td_int})", "INFO")
-        return candles
+        if data.get("status") != "error":
+            values = list(reversed(data.get("values", [])))
+            if len(values) >= 10:
+                candles = []
+                for v in values:
+                    try:
+                        ts = int(datetime.datetime.strptime(
+                            v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+                    except:
+                        ts = int(datetime.datetime.strptime(
+                            v["datetime"], "%Y-%m-%d").timestamp() * 1000)
+                    candles.append([ts, str(v["open"]), str(v["high"]),
+                                   str(v["low"]), str(v["close"]),
+                                   str(v.get("volume", "1000")), ts + 3600000])
+                price = float(candles[-1][4])
+                log("BTC Twelve Data: " + str(len(candles)) + " | $" + str(price))
+                _btc_cache = candles
+                _btc_cache_time = now_t
+                return candles
     except Exception as e:
-        log(f"Twelve Data BTC error: {e}", "ERROR")
-        return None
+        log("Twelve Data BTC error: " + str(e), "WARN")
 
-def get_candles(asset_key, interval, limit=60):
-    return fetch_gold(interval, limit) if ASSETS[asset_key]["is_gold"] \
-           else fetch_btc(interval, limit)
+    if _btc_cache:
+        log("BTC using old cache", "WARN")
+        return _btc_cache
+
+    log("BTC fetch FAILED!", "ERROR")
+    return None
+
+def get_candles(asset_key, limit=60):
+    if asset_key == "XAUUSD":
+        return fetch_gold(limit)
+    return fetch_btc(limit)
 
 # =======================================
 # INDICATORS
 # =======================================
 def calc_ema(prices, period):
-    if len(prices) < period:
-        return None
+    if len(prices) < period: return None
     k = 2 / (period + 1)
     e = sum(prices[:period]) / period
     for p in prices[period:]:
@@ -198,913 +344,778 @@ def calc_atr(candles, period=14):
         h  = float(candles[i][2])
         l  = float(candles[i][3])
         pc = float(candles[i-1][4])
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    if not trs:
-        return 1.0
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs: return 1.0
     return sum(trs[-period:]) / min(len(trs), period)
 
-# =======================================
-# MTF TREND
-# =======================================
-def get_mtf_trend(asset_key):
-    scores = []
-    for interval in ["1d", "4h", "1h"]:
-        candles = get_candles(asset_key, interval, 30)
-        if not candles or len(candles) < 15:
-            continue
-        closes = [float(c[4]) for c in candles]
-        e20    = calc_ema(closes, 20)
-        e50    = calc_ema(closes, min(50, len(closes)-1))
-        price  = closes[-1]
-        rec_hi = max(float(c[2]) for c in candles[-5:])
-        prv_hi = max(float(c[2]) for c in candles[-10:-5])
-        rec_lo = min(float(c[3]) for c in candles[-5:])
-        prv_lo = min(float(c[3]) for c in candles[-10:-5])
-        bull = bear = 0
-        if e20 and e50:
-            if e20 > e50: bull += 1
-            else:         bear += 1
-        if e20:
-            if price > e20: bull += 1
-            else:           bear += 1
-        if rec_hi > prv_hi: bull += 1
-        else:               bear += 1
-        if rec_lo > prv_lo: bull += 1
-        else:               bear += 1
-        scores.append(1 if bull > bear else -1 if bear > bull else 0)
-    if not scores:
-        return "NEUTRAL", 0
-    total = sum(scores)
-    if total >= 2:    return "STRONG_BUY", total
-    elif total == 1:  return "BUY", total
-    elif total <= -2: return "STRONG_SELL", total
-    elif total == -1: return "SELL", total
+def get_trend(candles):
+    if not candles or len(candles) < 20: return "NEUTRAL", 0
+    closes = [float(c[4]) for c in candles]
+    e20    = calc_ema(closes, 20)
+    e50    = calc_ema(closes, min(50, len(closes) - 1))
+    price  = closes[-1]
+    rec_hi = max(float(c[2]) for c in candles[-5:])
+    prv_hi = max(float(c[2]) for c in candles[-10:-5])
+    rec_lo = min(float(c[3]) for c in candles[-5:])
+    prv_lo = min(float(c[3]) for c in candles[-10:-5])
+    bull = bear = 0
+    if e20 and e50:
+        if e20 > e50: bull += 1
+        else:         bear += 1
+    if e20:
+        if price > e20: bull += 1
+        else:           bear += 1
+    if rec_hi > prv_hi: bull += 1
+    else:               bear += 1
+    if rec_lo > prv_lo: bull += 1
+    else:               bear += 1
+    s = bull - bear
+    if s >= 3:    return "STRONG_BUY", s
+    elif s >= 1:  return "BUY", s
+    elif s <= -3: return "STRONG_SELL", s
+    elif s <= -1: return "SELL", s
     return "NEUTRAL", 0
 
-# =======================================
-# SWEEP + CHOCH
-# =======================================
-def detect_sweep(candles, fib382, trend, atr_val):
-    if len(candles) < 6:
-        return False, "Not enough data"
+def detect_sweep(candles, fib382, direction, atr_val):
+    if len(candles) < 6: return False, "Not enough data"
     recent  = candles[-8:]
     vols    = [float(c[5]) for c in recent]
-    avg_vol = sum(vols[:-2]) / max(len(vols)-2, 1)
+    avg_vol = sum(vols[:-2]) / max(len(vols) - 2, 1)
     buf     = atr_val * 0.3
-    best    = 0
-    detail  = "No sweep"
-    found   = False
-    for i in range(len(recent)-1):
-        h   = float(recent[i][2])
-        l   = float(recent[i][3])
-        vol = float(recent[i][5])
-        vr  = vol / avg_vol if avg_vol > 0 else 1
-        nxt = float(recent[i+1][4])
-        if trend == "BUY":
-            if l < fib382-buf and nxt > fib382:
+    best    = 0; found = False; detail = "No sweep"
+    for i in range(len(recent) - 1):
+        hh  = float(recent[i][2]); l = float(recent[i][3])
+        vol = float(recent[i][5]); vr = vol / avg_vol if avg_vol > 0 else 1
+        nxt = float(recent[i + 1][4])
+        if direction == "BUY":
+            if l < fib382 - buf and nxt > fib382:
                 wick = fib382 - l
-                s = min(100, int(wick/atr_val*60 + vr*15))
+                s = min(100, int(wick / atr_val * 60 + vr * 15))
                 if s > best:
-                    best=s; found=True
-                    detail = f"Wick {wick:.2f} below zone, Vol {vr:.1f}x"
+                    best = s; found = True
+                    detail = "Wick " + str(round(wick, 2)) + " below | Vol " + str(round(vr, 1)) + "x"
         else:
-            if h > fib382+buf and nxt < fib382:
-                wick = h - fib382
-                s = min(100, int(wick/atr_val*60 + vr*15))
+            if hh > fib382 + buf and nxt < fib382:
+                wick = hh - fib382
+                s = min(100, int(wick / atr_val * 60 + vr * 15))
                 if s > best:
-                    best=s; found=True
-                    detail = f"Wick {wick:.2f} above zone, Vol {vr:.1f}x"
+                    best = s; found = True
+                    detail = "Wick " + str(round(wick, 2)) + " above | Vol " + str(round(vr, 1)) + "x"
     return found, detail
 
-def detect_choch(candles, trend, ema20):
-    if len(candles) < 8:
-        return False, "Not enough data"
+def detect_choch(candles, direction, ema20):
+    if len(candles) < 8: return False, "Not enough data"
     highs = [float(c[2]) for c in candles[-8:]]
     lows  = [float(c[3]) for c in candles[-8:]]
-    prev  = float(candles[-2][4])
-    curr  = float(candles[-1][4])
+    prev  = float(candles[-2][4]); curr = float(candles[-1][4])
     ecb   = ema20 and prev < ema20 and curr > ema20
     ecs   = ema20 and prev > ema20 and curr < ema20
-    if trend == "BUY":
+    if direction == "BUY":
         hl = min(lows[-3:]) > min(lows[-6:-3])
         bh = max(highs[-3:]) > max(highs[-6:-3])
-        if hl and bh:   return True, "Higher Low + Break of High"
-        if hl:          return True, "Higher Low formed"
-        if ecb:         return True, "EMA 20 Bullish Cross"
+        if hl and bh:  return True, "Higher Low + Break of High"
+        if hl:         return True, "Higher Low formed"
+        if ecb:        return True, "EMA 20 Bullish Cross"
         return False, "No CHOCH"
     else:
         lh = max(highs[-3:]) < max(highs[-6:-3])
         bl = min(lows[-3:]) < min(lows[-6:-3])
-        if lh and bl:   return True, "Lower High + Break of Low"
-        if lh:          return True, "Lower High formed"
-        if ecs:         return True, "EMA 20 Bearish Cross"
+        if lh and bl:  return True, "Lower High + Break of Low"
+        if lh:         return True, "Lower High formed"
+        if ecs:        return True, "EMA 20 Bearish Cross"
         return False, "No CHOCH"
 
 # =======================================
-# NEWS CHECK
+# NEWS
 # =======================================
 def check_news():
     try:
         r = requests.get(
             "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
             timeout=8)
-        if r.status_code != 200:
-            return True, "Safe"
+        if r.status_code != 200: return True, "Safe"
         now = datetime.datetime.utcnow()
         for ev in r.json():
-            if ev.get("impact") != "High":
-                continue
-            if ev.get("currency") not in ["USD", "XAU"]:
-                continue
+            if ev.get("impact") != "High": continue
+            if ev.get("currency") not in ["USD", "XAU", "GBP", "EUR"]: continue
             try:
-                ev_str = ev.get("date","") + " " + ev.get("time","12:00am")
+                ev_str = ev.get("date", "") + " " + ev.get("time", "12:00am")
                 ev_dt  = datetime.datetime.strptime(ev_str, "%Y-%m-%d %I:%M%p")
                 diff   = (ev_dt - now).total_seconds() / 60
                 if -30 <= diff <= 30:
-                    return False, f"{ev.get('title')} ({int(diff)}min)"
-            except:
-                continue
+                    return False, ev.get("title", "") + " (" + str(int(diff)) + "min)"
+            except: continue
         return True, "Safe"
     except:
         return True, "Safe"
+
+def get_todays_news():
+    try:
+        r = requests.get(
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            timeout=8)
+        if r.status_code != 200: return []
+        ist   = get_ist()
+        today = ist.date()
+        news  = []
+        for ev in r.json():
+            if ev.get("impact") not in ["High", "Medium"]: continue
+            if ev.get("currency") not in ["USD", "XAU", "GBP", "EUR", "JPY"]: continue
+            try:
+                ev_date = datetime.datetime.strptime(ev.get("date", ""), "%Y-%m-%d").date()
+                if ev_date == today:
+                    news.append({
+                        "title":    ev.get("title", ""),
+                        "time":     ev.get("time", ""),
+                        "currency": ev.get("currency", ""),
+                        "impact":   ev.get("impact", ""),
+                    })
+            except: continue
+        return news
+    except:
+        return []
 
 # =======================================
 # ANALYZE
 # =======================================
 def analyze(asset_key):
-    cfg   = ASSETS[asset_key]
-    c1h   = get_candles(asset_key, "1h", 60)
-    c5m   = get_candles(asset_key, "5m", 60)
-    if not c1h or not c5m:
+    cfg     = ASSETS[asset_key]
+    candles = get_candles(asset_key, 60)
+    if not candles:
+        log(asset_key + " - No data", "ERROR")
         return None
 
-    price            = float(c5m[-1][4])
-    mtf_trend, mtf_s = get_mtf_trend(asset_key)
-    if mtf_trend == "NEUTRAL":
+    price = float(candles[-1][4])
+    log(asset_key + " price: $" + str(price))
+
+    trend, ts = get_trend(candles)
+    if trend == "NEUTRAL":
+        log(asset_key + " - Neutral, skip")
         return None
 
-    trend  = "BUY" if "BUY" in mtf_trend else "SELL"
-    highs  = [float(c[2]) for c in c1h[-25:]]
-    lows   = [float(c[3]) for c in c1h[-25:]]
+    direction = "BUY" if "BUY" in trend else "SELL"
+    highs  = [float(c[2]) for c in candles[-25:]]
+    lows   = [float(c[3]) for c in candles[-25:]]
     sh, sl = max(highs), min(lows)
     rng    = sh - sl
-    if rng == 0:
-        return None
+    if rng == 0: return None
 
-    fib382   = (sh - rng*0.382) if trend=="BUY" else (sl + rng*0.382)
-    fib236   = (sh - rng*0.236) if trend=="BUY" else (sl + rng*0.236)
-    atr_val  = calc_atr(c1h, 14) or rng*0.02
-    closes5m = [float(c[4]) for c in c5m]
-    ema20    = calc_ema(closes5m, 20) or price
-    vols     = [float(c[5]) for c in c5m]
-    avg_vol  = sum(vols[-20:-1])/19 if len(vols)>=20 else sum(vols[:-1])/max(len(vols)-1,1)
-    vol_r    = vols[-1]/avg_vol if avg_vol > 0 else 0
-    last     = c5m[-1]
-    o, c_    = float(last[1]), float(last[4])
-    h_, l_   = float(last[2]), float(last[3])
-    csize    = h_ - l_
-    body_pct = (abs(c_-o)/csize*100) if csize > 0 else 0
+    fib382 = (sh - rng * 0.382) if direction == "BUY" else (sl + rng * 0.382)
+    fib236 = (sh - rng * 0.236) if direction == "BUY" else (sl + rng * 0.236)
+    atr_v  = calc_atr(candles, 14) or rng * 0.02
+    closes = [float(c[4]) for c in candles]
+    ema20  = calc_ema(closes, 20) or price
+
+    vols    = [float(c[5]) for c in candles]
+    avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else sum(vols[:-1]) / max(len(vols) - 1, 1)
+    vol_r   = vols[-1] / avg_vol if avg_vol > 0 else 0
+
+    last = candles[-1]
+    o, c_  = float(last[1]), float(last[4])
+    hh, ll = float(last[2]), float(last[3])
+    csize  = hh - ll
+    body_pct = (abs(c_ - o) / csize * 100) if csize > 0 else 0
+
     session  = get_session()
-    buf      = atr_val * 1.5
-    near382  = abs(price-fib382) <= buf
-    near236  = abs(price-fib236) <= buf
+    buf      = atr_v * 1.5
+    near382  = abs(price - fib382) <= buf
+    near236  = abs(price - fib236) <= buf
     near_any = near382 or near236
     zone_nm  = "38.2%" if near382 else "23.6%"
-    sweep_ok, sweep_det = detect_sweep(c5m, fib382, trend, atr_val)
-    choch_ok, choch_det = detect_choch(c5m, trend, ema20)
-    ema_ok   = (c_ > ema20*0.999) if trend=="BUY" else (c_ < ema20*1.001)
+
+    sweep_ok, sweep_det = detect_sweep(candles, fib382, direction, atr_v)
+    choch_ok, choch_det = detect_choch(candles, direction, ema20)
+    ema_ok   = (c_ > ema20 * 0.999) if direction == "BUY" else (c_ < ema20 * 1.001)
     news_ok, news_det   = check_news()
-    not_fri  = not (datetime.datetime.utcnow().weekday()==4 and
-                    datetime.datetime.utcnow().hour>=15)
+    not_fri  = not (datetime.datetime.utcnow().weekday() == 4 and
+                    datetime.datetime.utcnow().hour >= 15)
 
     checks = [
-        {"label": "MTF Trend (D+4H+1H)", "pass": abs(mtf_s)>=1, "w": 2},
-        {"label": "Good Session",         "pass": session["good"], "w": 2},
-        {"label": "Near 38.2% Zone",      "pass": near_any,       "w": 2},
-        {"label": "Liquidity Sweep",      "pass": sweep_ok,       "w": 2},
-        {"label": "CHOCH Confirmed",      "pass": choch_ok,       "w": 1},
-        {"label": "Full Body 60%+",       "pass": body_pct>=60,   "w": 1},
-        {"label": "Volume Spike",         "pass": vol_r>=cfg["vol_min"], "w": 1},
-        {"label": "EMA 20 Aligned",       "pass": ema_ok,         "w": 1},
-        {"label": "No High News",         "pass": news_ok,        "w": 1},
-        {"label": "Not Friday Close",     "pass": not_fri,        "w": 1},
+        {"label": "Trend (1H)",      "pass": abs(ts) >= 1,             "w": 2},
+        {"label": "Good Session",     "pass": session["good"],          "w": 2},
+        {"label": "Near 38.2% Zone",  "pass": near_any,                 "w": 2},
+        {"label": "Liquidity Sweep",  "pass": sweep_ok,                 "w": 2},
+        {"label": "CHOCH Confirmed",  "pass": choch_ok,                 "w": 1},
+        {"label": "Full Body 60%+",   "pass": body_pct >= 60,           "w": 1},
+        {"label": "Volume Spike",     "pass": vol_r >= cfg["vol_min"],  "w": 1},
+        {"label": "EMA 20 Aligned",   "pass": ema_ok,                   "w": 1},
+        {"label": "No High News",     "pass": news_ok,                  "w": 1},
+        {"label": "Not Friday Close", "pass": not_fri,                  "w": 1},
     ]
-    total_w  = sum(c["w"] for c in checks)
-    passed_w = sum(c["w"] for c in checks if c["pass"])
-    score    = round(passed_w/total_w*100)
-    if not all(c["pass"] for c in checks if c["w"]==2):
+
+    tw    = sum(c["w"] for c in checks)
+    pw    = sum(c["w"] for c in checks if c["pass"])
+    score = round(pw / tw * 100)
+    if not all(c["pass"] for c in checks if c["w"] == 2):
         score = min(score, 65)
 
     sl_amt = cfg["sl"]
     entry  = price
-    if trend == "BUY":
-        sl_p = round(entry-sl_amt, 2)
-        tp1  = round(entry+sl_amt*3, 2)
-        tp2  = round(entry+sl_amt*4, 2)
-        tp3  = round(entry+sl_amt*6, 2)
+    if direction == "BUY":
+        sl_p = round(entry - sl_amt, 2)
+        tp1  = round(entry + sl_amt * 3, 2)
+        tp2  = round(entry + sl_amt * 4, 2)
+        tp3  = round(entry + sl_amt * 6, 2)
     else:
-        sl_p = round(entry+sl_amt, 2)
-        tp1  = round(entry-sl_amt*3, 2)
-        tp2  = round(entry-sl_amt*4, 2)
-        tp3  = round(entry-sl_amt*6, 2)
+        sl_p = round(entry + sl_amt, 2)
+        tp1  = round(entry - sl_amt * 3, 2)
+        tp2  = round(entry - sl_amt * 4, 2)
+        tp3  = round(entry - sl_amt * 6, 2)
 
     return {
-        "asset": asset_key, "trend": trend,
-        "mtf_trend": mtf_trend, "score": score,
-        "entry": round(entry,2), "sl_p": sl_p,
+        "asset": asset_key, "trend": direction, "mtf_trend": trend,
+        "score": score, "entry": round(entry, 2), "sl_p": sl_p,
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl_amt": sl_amt,
-        "fib382": round(fib382,2), "fib236": round(fib236,2),
-        "sh": round(sh,2), "sl_level": round(sl,2),
-        "ema20": round(ema20,2), "vol_r": round(vol_r,2),
-        "body_pct": round(body_pct,1), "atr": round(atr_val,2),
+        "fib382": round(fib382, 2), "fib236": round(fib236, 2),
+        "sh": round(sh, 2), "sl_level": round(sl, 2),
+        "ema20": round(ema20, 2), "vol_r": round(vol_r, 2),
+        "body_pct": round(body_pct, 1), "atr": round(atr_v, 2),
         "sweep_det": sweep_det, "choch_det": choch_det,
         "session": session, "checks": checks,
         "news_ok": news_ok, "zone_nm": zone_nm,
     }
 
 # =======================================
-# CHECK TP/SL HIT
+# TP/SL HIT DETECTION
 # =======================================
-def check_tp_sl_hits():
-    """Check if any active trade hit TP or SL"""
-    if not active_trades:
-        return
-    for trade_id, trade in list(active_trades.items()):
-        asset   = trade["asset"]
-        c5m     = get_candles(asset, "5m", 5)
-        if not c5m:
-            continue
-        cur_hi  = max(float(c[2]) for c in c5m[-3:])
-        cur_lo  = min(float(c[3]) for c in c5m[-3:])
-        sym     = "XAUUSD" if asset=="XAUUSD" else "BTCUSDT"
-        cur_price = float(c5m[-1][4])
+def check_tp_sl():
+    if not active_trades: return
+    for trade_id in list(active_trades.keys()):
+        try:
+            trade   = active_trades[trade_id]
+            asset   = trade["asset"]
+            candles = get_candles(asset, 10)
+            if not candles: continue
+            cur_hi = max(float(c[2]) for c in candles[-3:])
+            cur_lo = min(float(c[3]) for c in candles[-3:])
+            cur    = float(candles[-1][4])
+            sym    = "XAUUSD" if asset == "XAUUSD" else "BTCUSDT"
+            icon   = "\u26a1" if asset == "XAUUSD" else "\u20bf"
 
-        if trade["trend"] == "BUY":
-            if cur_lo <= trade["sl_p"]:
-                msg = build_alert_msg(trade, "SL_HIT", cur_price)
-                send(msg)
-                del active_trades[trade_id]
-                log(f"{asset} SL HIT at {cur_price}", "INFO")
-            elif cur_hi >= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                msg = build_alert_msg(trade, "TP1_HIT", trade["tp1"])
-                send(msg)
-                log(f"{asset} TP1 HIT at {trade['tp1']}", "SUCCESS")
-            elif cur_hi >= trade["tp2"] and not trade.get("tp2_hit"):
-                trade["tp2_hit"] = True
-                msg = build_alert_msg(trade, "TP2_HIT", trade["tp2"])
-                send(msg)
-                log(f"{asset} TP2 HIT at {trade['tp2']}", "SUCCESS")
-            elif cur_hi >= trade["tp3"]:
-                msg = build_alert_msg(trade, "TP3_HIT", trade["tp3"])
-                send(msg)
-                del active_trades[trade_id]
-                log(f"{asset} TP3 HIT at {trade['tp3']}", "SUCCESS")
-        else:
-            if cur_hi >= trade["sl_p"]:
-                msg = build_alert_msg(trade, "SL_HIT", cur_price)
-                send(msg)
-                del active_trades[trade_id]
-                log(f"{asset} SL HIT at {cur_price}", "INFO")
-            elif cur_lo <= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                msg = build_alert_msg(trade, "TP1_HIT", trade["tp1"])
-                send(msg)
-                log(f"{asset} TP1 HIT at {trade['tp1']}", "SUCCESS")
-            elif cur_lo <= trade["tp2"] and not trade.get("tp2_hit"):
-                trade["tp2_hit"] = True
-                msg = build_alert_msg(trade, "TP2_HIT", trade["tp2"])
-                send(msg)
-                log(f"{asset} TP2 HIT at {trade['tp2']}", "SUCCESS")
-            elif cur_lo <= trade["tp3"]:
-                msg = build_alert_msg(trade, "TP3_HIT", trade["tp3"])
-                send(msg)
-                del active_trades[trade_id]
-                log(f"{asset} TP3 HIT at {trade['tp3']}", "SUCCESS")
-
-def build_alert_msg(trade, alert_type, price):
-    sym    = "XAUUSD" if trade["asset"]=="XAUUSD" else "BTCUSDT"
-    icon   = "\u26a1" if trade["asset"]=="XAUUSD" else "\u20bf"
-    profit = round(abs(trade["tp1"] - trade["entry"]), 2)
-    alert_msgs = {
-        "TP1_HIT": "\n".join([
-            f"{icon} {sym} TP1 HIT! \U0001f3af",
-            "\u2501"*22,
-            f"\U0001f4cd Entry  : {trade['entry']}",
-            f"\U0001f3af TP1    : {trade['tp1']} HIT!",
-            f"\U0001f4b0 Profit : +${profit}",
-            "\u2501"*22,
-            "\u2705 ACTION: Close 50% position NOW!",
-            f"\U0001f6e1 Move SL to breakeven: {trade['entry']}",
-            f"\U0001f3af TP2 target: {trade['tp2']}",
-            f"\U0001f680 TP3 target: {trade['tp3']}",
-            "\u2501"*22,
-            "Excellent trade! Keep trailing! \U0001f525",
-            "@Alphagoldsigna",
-        ]),
-        "TP2_HIT": "\n".join([
-            f"{icon} {sym} TP2 HIT! \U0001f929",
-            "\u2501"*22,
-            f"\U0001f4cd Entry  : {trade['entry']}",
-            f"\U0001f3af TP2    : {trade['tp2']} HIT!",
-            "\u2501"*22,
-            "\u2705 ACTION: Trail remaining 50%!",
-            f"\U0001f680 TP3 still open: {trade['tp3']}",
-            "\u2501"*22,
-            "Amazing trade! \U0001f911",
-            "@Alphagoldsigna",
-        ]),
-        "TP3_HIT": "\n".join([
-            f"{icon} {sym} TP3 HIT! \U0001f3c6",
-            "\u2501"*22,
-            f"\U0001f4cd Entry  : {trade['entry']}",
-            f"\U0001f680 TP3    : {trade['tp3']} HIT!",
-            "\u2501"*22,
-            "\u2705 ACTION: Close full position!",
-            "FULL TARGET ACHIEVED! \U0001f525\U0001f525\U0001f525",
-            "\u2501"*22,
-            "Perfect trade! \U0001f3c6\U0001f4aa",
-            "@Alphagoldsigna",
-        ]),
-        "SL_HIT": "\n".join([
-            f"{icon} {sym} SL HIT \U0001f6d1",
-            "\u2501"*22,
-            f"\U0001f4cd Entry  : {trade['entry']}",
-            f"\U0001f6d1 SL     : {trade['sl_p']} hit @ {price}",
-            f"\U0001f4b8 Loss   : -${trade['sl_amt']} (controlled)",
-            "\u2501"*22,
-            "\u26a0 Part of trading! Stay disciplined!",
-            "Next setup coming soon! \U0001f4aa",
-            "Risk was managed! \u2705",
-            "\u2501"*22,
-            "@Alphagoldsigna",
-        ]),
-    }
-    return alert_msgs.get(alert_type, "Alert")
-
-# =======================================
-# MORNING + EVENING MARKET VIEW
-# =======================================
-def build_market_view(time_of_day):
-    """Build morning/evening market analysis for both assets"""
-    lines = []
-    ist_time = (datetime.datetime.utcnow() +
-                datetime.timedelta(hours=5, minutes=30)).strftime("%I:%M %p")
-
-    if time_of_day == "morning":
-        header = "\U0001f31e Good Morning Traders!"
-        sub    = "\U0001f4ca Daily Market Analysis"
-    else:
-        header = "\U0001f307 Good Evening Traders!"
-        sub    = "\U0001f4ca Evening Market Update"
-
-    lines.append(header)
-    lines.append(sub)
-    lines.append(f"\U0001f550 Time: {ist_time} IST")
-    lines.append("\u2501"*22)
-
-    for asset_key in ASSETS:
-        sym  = "XAUUSD" if asset_key=="XAUUSD" else "BTCUSDT"
-        icon = "\u26a1" if asset_key=="XAUUSD" else "\u20bf"
-        c1h  = get_candles(asset_key, "1h", 60)
-
-        if not c1h:
-            lines.append(f"\n{icon} {sym}: Data unavailable \u26a0")
-            continue
-
-        price = float(c1h[-1][4])
-        mtf_trend, mtf_s = get_mtf_trend(asset_key)
-
-        highs  = [float(c[2]) for c in c1h[-20:]]
-        lows   = [float(c[3]) for c in c1h[-20:]]
-        sh, sl = max(highs), min(lows)
-        rng    = sh - sl
-        fib382 = sh - rng*0.382
-        fib236 = sh - rng*0.236
-
-        closes  = [float(c[4]) for c in c1h]
-        ema20   = calc_ema(closes, 20) or price
-        ema50   = calc_ema(closes, 50) or price
-        atr_val = calc_atr(c1h, 14) or 1
-
-        if "STRONG_BUY" in mtf_trend:
-            bias_icon = "\U0001f4c8\U0001f4c8"
-            bias      = "STRONG BULLISH"
-            action    = f"Buy dips at {round(fib382, 2)}"
-            do        = "\U0001f7e2 BUY BIAS - Look for BUY setups"
-        elif "BUY" in mtf_trend:
-            bias_icon = "\U0001f4c8"
-            bias      = "BULLISH"
-            action    = f"Buy pullback to {round(fib382, 2)}"
-            do        = "\U0001f7e2 BUY BIAS - Prefer BUY setups"
-        elif "STRONG_SELL" in mtf_trend:
-            bias_icon = "\U0001f4c9\U0001f4c9"
-            bias      = "STRONG BEARISH"
-            action    = f"Sell rally at {round(fib382, 2)}"
-            do        = "\U0001f534 SELL BIAS - Look for SELL setups"
-        elif "SELL" in mtf_trend:
-            bias_icon = "\U0001f4c9"
-            bias      = "BEARISH"
-            action    = f"Sell rally to {round(fib382, 2)}"
-            do        = "\U0001f534 SELL BIAS - Prefer SELL setups"
-        else:
-            bias_icon = "\u23f8"
-            bias      = "NEUTRAL"
-            action    = "Wait for clear direction"
-            do        = "\U0001f7e1 NEUTRAL - No trade now"
-
-        lines.append(f"\n{icon} {sym} Analysis {bias_icon}")
-        lines.append("\u2500"*22)
-        lines.append(f"\U0001f4b0 Price     : {price}")
-        lines.append(f"\U0001f4ca Trend     : {bias}")
-        lines.append(f"\U0001f4cf EMA 20    : {round(ema20, 2)}")
-        lines.append(f"\U0001f4cf EMA 50    : {round(ema50, 2)}")
-        lines.append(f"\U0001f3af 38.2% Zone: {round(fib382, 2)}")
-        lines.append(f"\U0001f3af 23.6% Zone: {round(fib236, 2)}")
-        lines.append(f"\U0001f6e1 Support   : {round(sl, 2)}")
-        lines.append(f"\u26a0  Resistance: {round(sh, 2)}")
-        lines.append(f"\U0001f4e1 ATR       : {round(atr_val, 2)}")
-        lines.append(f"\u2714 {do}")
-        lines.append(f"\U0001f4cc Action    : {action}")
-
-    lines.append("\n" + "\u2501"*22)
-    lines.append("\U0001f9e0 Strategy: 38.2% Liquidity Sweep")
-    lines.append("\u23f3 Wait for sweep + confirmation")
-    lines.append("\U0001f4af Min Score: 70%+ for entry")
-    lines.append("\u26a0 Always confirm on your chart!")
-    lines.append("\U0001f4e2 @Alphagoldsigna")
-    lines.append("\U0001f916 Alpha Agent v5.0")
-    return "\n".join(lines)
-
-def check_and_send_market_view():
-    """Send morning and evening market view at scheduled times"""
-    global morning_sent, evening_sent, last_view_date
-    now     = datetime.datetime.utcnow()
-    today   = now.date()
-
-    # Reset flags at midnight
-    if last_view_date != today:
-        morning_sent   = False
-        evening_sent   = False
-        last_view_date = today
-
-    h, m = now.hour, now.minute
-
-    # Morning view at 03:30 GMT = 09:00 IST
-    if h == MORNING_VIEW_HOUR_GMT and m >= MORNING_VIEW_MIN_GMT and not morning_sent:
-        log("Sending morning market view...", "INFO")
-        msg = build_market_view("morning")
-        if send(msg):
-            morning_sent = True
-            log("Morning view sent!", "SUCCESS")
-
-    # Evening view at 12:30 GMT = 18:00 IST
-    if h == EVENING_VIEW_HOUR_GMT and m >= EVENING_VIEW_MIN_GMT and not evening_sent:
-        log("Sending evening market view...", "INFO")
-        msg = build_market_view("evening")
-        if send(msg):
-            evening_sent = True
-            log("Evening view sent!", "SUCCESS")
+            if trade["trend"] == "BUY":
+                if cur_lo <= trade["sl_p"]:
+                    send("\n".join([
+                        icon + " " + sym + " SL HIT \U0001f6d1",
+                        "=" * 22,
+                        "\U0001f4cd Entry : " + str(trade["entry"]),
+                        "\U0001f6d1 SL hit: " + str(trade["sl_p"]) + " @ $" + str(cur),
+                        "\U0001f4b8 Loss  : -$" + str(trade["sl_amt"]) + " (controlled!)",
+                        "=" * 22,
+                        "\u26a0 Part of trading! Stay disciplined!",
+                        "\U0001f4aa Next setup coming soon!",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+                    del active_trades[trade_id]
+                elif cur_hi >= trade["tp3"] and not trade.get("tp3_hit"):
+                    send("\n".join([
+                        icon + " " + sym + " TP3 HIT! \U0001f3c6",
+                        "=" * 22,
+                        "\U0001f680 TP3 : " + str(trade["tp3"]) + " HIT!",
+                        "\u2705 Close FULL position!",
+                        "FULL TARGET ACHIEVED! \U0001f525\U0001f525\U0001f525",
+                        "\U0001f3c6 Perfect trade! \U0001f4aa",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+                    del active_trades[trade_id]
+                elif cur_hi >= trade["tp2"] and not trade.get("tp2_hit"):
+                    trade["tp2_hit"] = True
+                    send("\n".join([
+                        icon + " " + sym + " TP2 HIT! \U0001f929",
+                        "=" * 22,
+                        "\U0001f4cd Entry : " + str(trade["entry"]),
+                        "\U0001f3af TP2   : " + str(trade["tp2"]) + " HIT!",
+                        "=" * 22,
+                        "\u2705 Trail remaining 50%!",
+                        "\U0001f680 TP3 open: " + str(trade["tp3"]),
+                        "Amazing trade! \U0001f911",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+                elif cur_hi >= trade["tp1"] and not trade.get("tp1_hit"):
+                    trade["tp1_hit"] = True
+                    profit = round(abs(trade["tp1"] - trade["entry"]), 2)
+                    send("\n".join([
+                        icon + " " + sym + " TP1 HIT! \U0001f3af",
+                        "=" * 22,
+                        "\U0001f4cd Entry  : " + str(trade["entry"]),
+                        "\U0001f3af TP1    : " + str(trade["tp1"]) + " HIT!",
+                        "\U0001f4b0 Profit : +$" + str(profit),
+                        "=" * 22,
+                        "\u2705 Close 50% position NOW!",
+                        "\U0001f6e1 Move SL to entry: " + str(trade["entry"]),
+                        "\U0001f3af TP2 next: " + str(trade["tp2"]),
+                        "\U0001f680 TP3 next: " + str(trade["tp3"]),
+                        "Excellent! Keep trailing! \U0001f525",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+            else:
+                if cur_hi >= trade["sl_p"]:
+                    send("\n".join([
+                        icon + " " + sym + " SL HIT \U0001f6d1",
+                        "=" * 22,
+                        "\U0001f4cd Entry : " + str(trade["entry"]),
+                        "\U0001f6d1 SL hit: " + str(trade["sl_p"]) + " @ $" + str(cur),
+                        "\U0001f4b8 Loss  : -$" + str(trade["sl_amt"]) + " (controlled!)",
+                        "=" * 22,
+                        "\u26a0 Part of trading! Stay disciplined!",
+                        "\U0001f4aa Next setup coming soon!",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+                    del active_trades[trade_id]
+                elif cur_lo <= trade["tp3"] and not trade.get("tp3_hit"):
+                    send("\n".join([
+                        icon + " " + sym + " TP3 HIT! \U0001f3c6",
+                        "=" * 22,
+                        "\U0001f680 TP3 : " + str(trade["tp3"]) + " HIT!",
+                        "\u2705 Close FULL position!",
+                        "FULL TARGET ACHIEVED! \U0001f525\U0001f525\U0001f525",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+                    del active_trades[trade_id]
+                elif cur_lo <= trade["tp2"] and not trade.get("tp2_hit"):
+                    trade["tp2_hit"] = True
+                    send("\n".join([
+                        icon + " " + sym + " TP2 HIT! \U0001f929",
+                        "=" * 22,
+                        "\U0001f4cd Entry : " + str(trade["entry"]),
+                        "\U0001f3af TP2   : " + str(trade["tp2"]) + " HIT!",
+                        "=" * 22,
+                        "\u2705 Trail remaining 50%!",
+                        "\U0001f680 TP3 open: " + str(trade["tp3"]),
+                        "Amazing trade! \U0001f911",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+                elif cur_lo <= trade["tp1"] and not trade.get("tp1_hit"):
+                    trade["tp1_hit"] = True
+                    profit = round(abs(trade["tp1"] - trade["entry"]), 2)
+                    send("\n".join([
+                        icon + " " + sym + " TP1 HIT! \U0001f3af",
+                        "=" * 22,
+                        "\U0001f4cd Entry  : " + str(trade["entry"]),
+                        "\U0001f3af TP1    : " + str(trade["tp1"]) + " HIT!",
+                        "\U0001f4b0 Profit : +$" + str(profit),
+                        "=" * 22,
+                        "\u2705 Close 50% position NOW!",
+                        "\U0001f6e1 Move SL to entry: " + str(trade["entry"]),
+                        "\U0001f3af TP2 next: " + str(trade["tp2"]),
+                        "\U0001f680 TP3 next: " + str(trade["tp3"]),
+                        "Excellent! Keep trailing! \U0001f525",
+                        "\U0001f4e2 @Alphagoldsigna",
+                    ]))
+        except Exception as e:
+            log("TP/SL error: " + str(e), "ERROR")
 
 # =======================================
-# BUILD SIGNAL MESSAGE
+# BUILD MESSAGES
 # =======================================
-def build_msg(d):
-    stars  = "\u2b50\u2b50\u2b50" if d["score"]>=85 else "\u2b50\u2b50" if d["score"]>=70 else "\u2b50"
-    trap   = "Seller's Trap \U0001f43b" if d["trend"]=="BUY" else "Buyer's Trap \U0001f403"
-    sym    = "XAUUSD" if d["asset"]=="XAUUSD" else "BTCUSDT"
-    icon   = "\u26a1" if d["asset"]=="XAUUSD" else "\u20bf"
+def build_signal(d):
+    stars  = "\u2b50\u2b50\u2b50" if d["score"] >= 80 else "\u2b50\u2b50" if d["score"] >= 65 else "\u2b50"
+    trap   = "Seller's Trap \U0001f43b" if d["trend"] == "BUY" else "Buyer's Trap \U0001f403"
+    sym    = "XAUUSD" if d["asset"] == "XAUUSD" else "BTCUSDT"
+    icon   = "\u26a1" if d["asset"] == "XAUUSD" else "\u20bf"
+    sig    = "\U0001f7e2\u2b06 BUY" if d["trend"] == "BUY" else "\U0001f534\u2b07 SELL"
     news   = "\u2705 Safe" if d["news_ok"] else "\u26a0 Risk"
+    conf   = "HIGH \U0001f525" if d["score"] >= 80 else "GOOD \u26a1" if d["score"] >= 65 else "OK \u26a0"
     passed = "\n".join("  \u2705 " + c["label"] for c in d["checks"] if c["pass"])
-    sig_icon = "\U0001f7e2\u2b06" if d["trend"]=="BUY" else "\U0001f534\u2b07"
-    conf   = "HIGH \U0001f525" if d["score"]>=85 else "GOOD \u26a1" if d["score"]>=70 else "LOW \u26a0"
-
     if d["trend"] == "BUY":
         logic = "\n".join([
-            f"\U0001f4ca {d['mtf_trend']} trend Daily+4H+1H confirmed.",
-            f"\U0001f4c8 1H sharp bullish impulse. Fib zone: {d['fib382']}.",
-            f"\U0001f43b Sellers swept liquidity BELOW zone!",
-            f"\U0001f3e6 Smart money trapped sellers - BUY started.",
-            f"\U0001f504 CHOCH: {d['choch_det']}",
-            f"\U0001f55f Strong {d['body_pct']}% body candle above EMA {d['ema20']}.",
-            f"\U0001f4a5 Volume {d['vol_r']}x spike = Institutional buying!",
-            f"\u23f0 Session: {d['session']['name']} = Prime time!",
+            "\U0001f4ca 1H: " + d["mtf_trend"],
+            "\U0001f4c8 Sharp bullish impulse. Zone: " + str(d["fib382"]),
+            "\U0001f43b Sellers swept below zone TRAPPED!",
+            "\U0001f3e6 Smart money BUY started",
+            "\U0001f504 CHOCH: " + d["choch_det"],
+            "\U0001f55f " + str(d["body_pct"]) + "% body candle above EMA " + str(d["ema20"]),
+            "\U0001f4a5 Volume " + str(d["vol_r"]) + "x = Institutional BUY!",
+            "\u23f0 Session: " + d["session"]["name"],
         ])
     else:
         logic = "\n".join([
-            f"\U0001f4ca {d['mtf_trend']} trend Daily+4H+1H confirmed.",
-            f"\U0001f4c9 1H sharp bearish impulse. Fib zone: {d['fib382']}.",
-            f"\U0001f403 Buyers swept liquidity ABOVE zone!",
-            f"\U0001f3e6 Smart money trapped buyers - SELL started.",
-            f"\U0001f504 CHOCH: {d['choch_det']}",
-            f"\U0001f55f Strong {d['body_pct']}% body candle below EMA {d['ema20']}.",
-            f"\U0001f4a5 Volume {d['vol_r']}x spike = Institutional selling!",
-            f"\u23f0 Session: {d['session']['name']} = Prime time!",
+            "\U0001f4ca 1H: " + d["mtf_trend"],
+            "\U0001f4c9 Sharp bearish impulse. Zone: " + str(d["fib382"]),
+            "\U0001f403 Buyers swept above zone TRAPPED!",
+            "\U0001f3e6 Smart money SELL started",
+            "\U0001f504 CHOCH: " + d["choch_det"],
+            "\U0001f55f " + str(d["body_pct"]) + "% body candle below EMA " + str(d["ema20"]),
+            "\U0001f4a5 Volume " + str(d["vol_r"]) + "x = Institutional SELL!",
+            "\u23f0 Session: " + d["session"]["name"],
         ])
-
-    lines = [
-        f"{icon} {sym} {d['trend']} SIGNAL {sig_icon}",
-        f"{'='*24}",
-        f"\U0001f4cd Entry   : {d['entry']}",
-        f"\U0001f6d1 SL      : {d['sl_p']} (Max ${d['sl_amt']})",
-        f"\U0001f3af TP1     : {d['tp1']} (1:3) \u2192 Close 50%",
-        f"\U0001f3af TP2     : {d['tp2']} (1:4) \u2192 Trail 50%",
-        f"\U0001f680 TP3     : {d['tp3']} (1:6) \u2192 Extended",
-        f"{'='*24}",
-        f"\U0001f4ca Trend   : {d['mtf_trend']}",
-        f"\U0001f9f2 Setup   : {trap}",
-        f"\U0001f4d0 Zone    : {d['fib382']} ({d['zone_nm']})",
-        f"\U0001f4cf Swing   : {d['sl_level']} \u2192 {d['sh']}",
-        f"\U0001f4b9 EMA 20  : {d['ema20']}",
-        f"\U0001f4a5 Volume  : {d['vol_r']}x avg",
-        f"\U0001f55f Candle  : {d['body_pct']}% body",
-        f"\U0001f4e1 ATR     : {d['atr']}",
-        f"\u23f0 Session : {d['session']['name']}",
-        f"\U0001f4f0 News    : {news}",
-        f"{'='*24}",
-        f"\U0001f4cb TRADE LOGIC:",
+    return "\n".join([
+        icon + " " + sym + " " + sig + " " + icon,
+        "=" * 24,
+        "\U0001f4cd Entry   : " + str(d["entry"]),
+        "\U0001f6d1 SL      : " + str(d["sl_p"]) + " (Max $" + str(d["sl_amt"]) + ")",
+        "\U0001f3af TP1     : " + str(d["tp1"]) + " (1:3) \u2192 Close 50%",
+        "\U0001f3af TP2     : " + str(d["tp2"]) + " (1:4) \u2192 Trail 50%",
+        "\U0001f680 TP3     : " + str(d["tp3"]) + " (1:6) \u2192 Extended",
+        "=" * 24,
+        "\U0001f9f2 Setup   : " + trap,
+        "\U0001f4d0 Zone    : " + str(d["fib382"]) + " (" + d["zone_nm"] + ")",
+        "\U0001f4cf Swing   : " + str(d["sl_level"]) + " to " + str(d["sh"]),
+        "\U0001f4a5 Volume  : " + str(d["vol_r"]) + "x avg",
+        "\U0001f55f Candle  : " + str(d["body_pct"]) + "% body",
+        "\U0001f4e1 ATR     : " + str(d["atr"]),
+        "\u23f0 Session : " + d["session"]["name"],
+        "\U0001f4f0 News    : " + news,
+        "=" * 24,
+        "\U0001f4cb TRADE LOGIC:",
         logic,
-        f"{'='*24}",
-        f"\u2705 CONDITIONS MET:",
+        "=" * 24,
+        "\u2705 CONDITIONS:",
         passed,
-        f"{'='*24}",
-        f"\U0001f4af Score   : {d['score']}% {stars}",
-        f"\U0001f4aa Confidence: {conf}",
-        f"\u26a0  Max SL  : ${d['sl_amt']} only!",
-        f"\U0001f4cc TP1 hit \u2192 Close 50% + Move SL to entry",
-        f"\U0001f4cc TP2 hit \u2192 Trail remaining 50%",
-        f"{'='*24}",
-        f"\U0001f4e2 @Alphagoldsigna",
-        f"\U0001f916 Alpha Agent v5.0",
+        "=" * 24,
+        "\U0001f4af Score   : " + str(d["score"]) + "% " + stars,
+        "\U0001f4aa Confidence: " + conf,
+        "\u26a0  Max SL  : $" + str(d["sl_amt"]) + " only!",
+        "\U0001f4cc TP1 hit \u2192 Close 50% + Move SL to entry",
+        "=" * 24,
+        "\U0001f4e2 @Alphagoldsigna",
+        "\U0001f916 Alpha Agent v5.1",
+    ])
+
+def build_view(time_of_day):
+    ist = get_ist()
+    if time_of_day == "morning":
+        hdr = "\U0001f31e Good Morning Traders!"
+        sub = "\U0001f4ca Morning Market Analysis"
+    else:
+        hdr = "\U0001f307 Good Evening Traders!"
+        sub = "\U0001f4ca Evening Market Update"
+    lines = [hdr, sub, "\U0001f550 " + ist.strftime("%I:%M %p") + " IST", "=" * 24]
+    for asset_key in ASSETS:
+        sym  = "XAUUSD" if asset_key == "XAUUSD" else "BTCUSDT"
+        icon = "\u26a1" if asset_key == "XAUUSD" else "\u20bf"
+        candles = get_candles(asset_key, 60)
+        if not candles:
+            lines += ["", icon + " " + sym + ": Data unavailable \u26a0"]
+            continue
+        price = float(candles[-1][4])
+        trend, ts = get_trend(candles)
+        highs  = [float(c[2]) for c in candles[-20:]]
+        lows   = [float(c[3]) for c in candles[-20:]]
+        sh, sl = max(highs), min(lows)
+        rng    = sh - sl
+        fib382 = sh - rng * 0.382
+        fib236 = sh - rng * 0.236
+        closes = [float(c[4]) for c in candles]
+        ema20  = calc_ema(closes, 20) or price
+        ema50  = calc_ema(closes, 50) or price
+        atr_v  = calc_atr(candles, 14) or 1
+        if "STRONG_BUY" in trend:
+            b_icon = "\U0001f4c8\U0001f4c8"; bias = "STRONG BULLISH"
+            action = "Buy dips at " + str(round(fib382, 2))
+            do     = "\U0001f7e2 STRONG BUY BIAS"
+        elif "BUY" in trend:
+            b_icon = "\U0001f4c8"; bias = "BULLISH"
+            action = "Buy pullback to " + str(round(fib382, 2))
+            do     = "\U0001f7e2 BUY BIAS"
+        elif "STRONG_SELL" in trend:
+            b_icon = "\U0001f4c9\U0001f4c9"; bias = "STRONG BEARISH"
+            action = "Sell rally at " + str(round(fib382, 2))
+            do     = "\U0001f534 STRONG SELL BIAS"
+        elif "SELL" in trend:
+            b_icon = "\U0001f4c9"; bias = "BEARISH"
+            action = "Sell rally to " + str(round(fib382, 2))
+            do     = "\U0001f534 SELL BIAS"
+        else:
+            b_icon = "\u23f8"; bias = "NEUTRAL"
+            action = "Wait for direction"
+            do     = "\U0001f7e1 NEUTRAL"
+        lines += [
+            "",
+            icon + " " + sym + " " + b_icon,
+            "\u2500" * 20,
+            "\U0001f4b0 Price     : " + str(price),
+            "\U0001f4ca Trend     : " + bias,
+            "\U0001f4cf EMA 20    : " + str(round(ema20, 2)),
+            "\U0001f4cf EMA 50    : " + str(round(ema50, 2)),
+            "\U0001f3af 38.2% Zone: " + str(round(fib382, 2)),
+            "\U0001f3af 23.6% Zone: " + str(round(fib236, 2)),
+            "\U0001f6e1 Support   : " + str(round(sl, 2)),
+            "\u26a0  Resistance: " + str(round(sh, 2)),
+            "\U0001f4e1 ATR       : " + str(round(atr_v, 2)),
+            "\u2714 " + do,
+            "\U0001f4cc Action    : " + action,
+        ]
+    news_list = get_todays_news()
+    lines += ["", "=" * 24, "\U0001f4f0 TODAY'S MAJOR NEWS:"]
+    if news_list:
+        for n in news_list[:6]:
+            imp = "\U0001f534" if n["impact"] == "High" else "\U0001f7e1"
+            lines.append(imp + " " + n["currency"] + " | " + n["title"] + " @ " + n["time"])
+    else:
+        lines.append("\u2705 No major news today!")
+    lines += [
+        "=" * 24,
+        "\U0001f9e0 Strategy: 38.2% Liquidity Sweep",
+        "\u23f3 Wait for sweep + confirmation",
+        "\U0001f4e2 @Alphagoldsigna",
+        "\U0001f916 Alpha Agent v5.1",
     ]
     return "\n".join(lines)
 
+def build_news_alert(news_list):
+    ist   = get_ist()
+    lines = ["\U0001f6a8 MAJOR NEWS ALERT!",
+             "\U0001f550 " + ist.strftime("%I:%M %p") + " IST", "=" * 24]
+    for n in news_list:
+        imp = "\U0001f534" if n["impact"] == "High" else "\U0001f7e1"
+        lines.append(imp + " " + n["currency"] + " | " + n["title"] + " @ " + n["time"])
+    lines += ["=" * 24, "\U0001f6d1 Avoid 30min before/after!",
+              "\U0001f4b0 High volatility expected!", "\U0001f4e2 @Alphagoldsigna"]
+    return "\n".join(lines)
+
+def build_weekly():
+    now  = datetime.datetime.utcnow()
+    week = now.isocalendar()[1]
+    ws   = [s for s in signal_history if s.get("week") == week and s.get("year") == now.year]
+    total= len(ws)
+    wins = len([s for s in ws if s.get("result") == "win"])
+    losses=len([s for s in ws if s.get("result") == "loss"])
+    wr   = round(wins / total * 100) if total > 0 else 0
+    pnl  = sum(s.get("pnl", 0) for s in ws)
+    grade= "A+" if wr >= 80 else "A" if wr >= 70 else "B+" if wr >= 60 else "B" if wr >= 50 else "C"
+    xau  = [s for s in ws if s["asset"] == "XAUUSD"]
+    btc  = [s for s in ws if s["asset"] == "BTCUSD"]
+    xwr  = round(len([s for s in xau if s.get("result") == "win"]) / max(len(xau), 1) * 100)
+    bwr  = round(len([s for s in btc if s.get("result") == "win"]) / max(len(btc), 1) * 100)
+    edges = []
+    if wr >= 70:  edges.append("Strategy working well!")
+    if xwr >= 70: edges.append("XAUUSD strong (" + str(xwr) + "%)")
+    if bwr >= 70: edges.append("BTCUSDT strong (" + str(bwr) + "%)")
+    if not edges: edges.append("Focus on quality setups next week")
+    return "\n".join([
+        "\U0001f4ca WEEKLY REPORT - Week #" + str(week),
+        "=" * 24,
+        "\U0001f4ca Signals : " + str(total),
+        "\u2705 Wins    : " + str(wins),
+        "\u274c Losses  : " + str(losses),
+        "\U0001f3af Win Rate: " + str(wr) + "%",
+        "\U0001f4b0 P&L     : " + ("+$" if pnl >= 0 else "-$") + str(abs(round(pnl, 1))),
+        "\U0001f3c6 Grade   : " + grade,
+        "=" * 24,
+        "\u26a1 XAUUSD : " + str(len(xau)) + " | " + str(xwr) + "%",
+        "\u20bf BTC    : " + str(len(btc)) + " | " + str(bwr) + "%",
+        "=" * 24,
+        "\U0001f4a1 EDGES:",
+    ] + ["\u2714 " + e for e in edges] + [
+        "=" * 24,
+        "\U0001f4e2 @Alphagoldsigna",
+        "\U0001f916 Alpha Agent v5.1",
+    ])
+
+def build_monthly():
+    now   = datetime.datetime.utcnow()
+    mname = ["Jan","Feb","Mar","Apr","May","Jun",
+             "Jul","Aug","Sep","Oct","Nov","Dec"][now.month - 1]
+    ms    = [s for s in signal_history
+             if s.get("month") == now.month and s.get("year") == now.year]
+    total = len(ms)
+    wins  = len([s for s in ms if s.get("result") == "win"])
+    losses= len([s for s in ms if s.get("result") == "loss"])
+    wr    = round(wins / total * 100) if total > 0 else 0
+    pnl   = sum(s.get("pnl", 0) for s in ms)
+    grade = "A+" if wr >= 80 else "A" if wr >= 70 else "B+" if wr >= 60 else "B" if wr >= 50 else "C"
+    xau   = [s for s in ms if s["asset"] == "XAUUSD"]
+    btc   = [s for s in ms if s["asset"] == "BTCUSD"]
+    xwr   = round(len([s for s in xau if s.get("result") == "win"]) / max(len(xau), 1) * 100)
+    bwr   = round(len([s for s in btc if s.get("result") == "win"]) / max(len(btc), 1) * 100)
+    sess_map = {}
+    for s in ms:
+        sess = s.get("session", "Unknown")
+        if sess not in sess_map: sess_map[sess] = {"w": 0, "l": 0}
+        if s.get("result") == "win": sess_map[sess]["w"] += 1
+        else: sess_map[sess]["l"] += 1
+    return "\n".join([
+        "\U0001f4ca MONTHLY REPORT - " + mname + " " + str(now.year),
+        "=" * 24,
+        "\U0001f4ca Signals : " + str(total),
+        "\u2705 Wins    : " + str(wins),
+        "\u274c Losses  : " + str(losses),
+        "\U0001f3af Win Rate: " + str(wr) + "%",
+        "\U0001f4b0 P&L     : " + ("+$" if pnl >= 0 else "-$") + str(abs(round(pnl, 1))),
+        "\U0001f3c6 Grade   : " + grade,
+        "=" * 24,
+        "\u26a1 XAUUSD : " + str(len(xau)) + " | " + str(xwr) + "%",
+        "\u20bf BTC    : " + str(len(btc)) + " | " + str(bwr) + "%",
+        "=" * 24,
+        "\U0001f4dd SESSIONS:",
+    ] + ["â€¢ " + k + ": " + str(v["w"]) + "W/" + str(v["l"]) + "L"
+         for k, v in sess_map.items()] + [
+        "=" * 24,
+        "\U0001f4e2 @Alphagoldsigna",
+        "\U0001f916 Alpha Agent v5.1",
+    ])
+
 # =======================================
-# SEND TELEGRAM
+# SEND
 # =======================================
 def send(msg):
     try:
         r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage",
             json={"chat_id": CHAT_ID, "text": msg},
             timeout=10)
         d = r.json()
         if d.get("ok"):
             log("Sent!", "SUCCESS")
             return True
-        log(f"Telegram: {d.get('description')}", "ERROR")
+        log("Telegram: " + str(d.get("description", "")), "ERROR")
         return False
     except Exception as e:
-        log(f"Send error: {e}", "ERROR")
+        log("Send error: " + str(e), "ERROR")
         return False
 
-
 # =======================================
-# WEEKLY PERFORMANCE REPORT
+# SCAN
 # =======================================
-def build_weekly_report():
-    now   = datetime.datetime.utcnow()
-    week  = now.isocalendar()[1]
-    year  = now.year
-
-    # Get this week signals
-    week_sigs = [s for s in signal_history if s.get("week") == week and s.get("year") == year]
-
-    total  = len(week_sigs)
-    wins   = len([s for s in week_sigs if s.get("result") == "win"])
-    losses = len([s for s in week_sigs if s.get("result") == "loss"])
-    wr     = round(wins / total * 100) if total > 0 else 0
-    pnl    = sum(s.get("pnl", 0) for s in week_sigs)
-
-    xau_sigs = [s for s in week_sigs if s["asset"] == "XAUUSD"]
-    btc_sigs = [s for s in week_sigs if s["asset"] == "BTCUSD"]
-    xau_wr   = round(len([s for s in xau_sigs if s.get("result")=="win"]) / len(xau_sigs) * 100) if xau_sigs else 0
-    btc_wr   = round(len([s for s in btc_sigs if s.get("result")=="win"]) / len(btc_sigs) * 100) if btc_sigs else 0
-
-    # Best session this week
-    sess_map = {}
-    for s in week_sigs:
-        sess = s.get("session", "Unknown")
-        if sess not in sess_map:
-            sess_map[sess] = {"w": 0, "l": 0}
-        if s.get("result") == "win":
-            sess_map[sess]["w"] += 1
-        else:
-            sess_map[sess]["l"] += 1
-    best_sess = max(sess_map.items(), key=lambda x: x[1]["w"] / max(x[1]["w"] + x[1]["l"], 1), default=None)
-
-    # Grade
-    grade = "A+" if wr >= 80 else "A" if wr >= 70 else "B+" if wr >= 60 else "B" if wr >= 50 else "C"
-
-    # Edges detected
-    edges = []
-    if wr >= 70:
-        edges.append("Strategy working well this week!")
-    if xau_wr >= 70:
-        edges.append("XAUUSD performing strongly (" + str(xau_wr) + "% WR)")
-    if btc_wr >= 70:
-        edges.append("BTCUSDT performing strongly (" + str(btc_wr) + "% WR)")
-    if not edges:
-        edges.append("Focus on quality setups next week")
-
-    insights = []
-    if total == 0:
-        insights.append("No signals sent this week - market was ranging")
-    if best_sess:
-        insights.append("Best session: " + best_sess[0])
-    avg_score = round(sum(s.get("score", 0) for s in week_sigs) / max(total, 1))
-    insights.append("Average signal score: " + str(avg_score) + "%")
-
-    lines = [
-        "ðŸ“Š WEEKLY PERFORMANCE REPORT",
-        "Week #" + str(week) + " - " + str(year),
-        "=" * 24,
-        "ðŸ“Š Total Signals : " + str(total),
-        "âœ… Wins         : " + str(wins),
-        "âŒ Losses       : " + str(losses),
-        "ðŸŽ¯ Win Rate     : " + str(wr) + "%",
-        "ðŸ’° Net P&L      : " + ("+" if pnl >= 0 else "") + "$" + str(round(pnl, 1)),
-        "ðŸ† Grade        : " + grade,
-        "=" * 24,
-        "âš¡ XAUUSD       : " + str(len(xau_sigs)) + " signals | " + str(xau_wr) + "% WR",
-        "â‚¿ BTCUSDT      : " + str(len(btc_sigs)) + " signals | " + str(btc_wr) + "% WR",
-        "=" * 24,
-        "ðŸ’¡ EDGES THIS WEEK:",
-    ] + ["âœ” " + e for e in edges] + [
-        "=" * 24,
-        "ðŸ§  INSIGHTS:",
-    ] + ["â€¢ " + i for i in insights] + [
-        "=" * 24,
-        wr >= 70 and "ðŸ”¥ Excellent week! Keep the discipline!" or
-        wr >= 50 and "ðŸ’ª Good effort! Focus on quality next week!" or
-        "ðŸ’¡ Review setups - focus on conditions!",
-        "=" * 24,
-        "ðŸ“¢ @Alphagoldsigna",
-        "ðŸ¤– Alpha Agent v5.0",
-    ]
-    return "\n".join(lines)
-
-# =======================================
-# MONTHLY PERFORMANCE REPORT
-# =======================================
-def build_monthly_report():
-    now   = datetime.datetime.utcnow()
-    month = now.month
-    year  = now.year
-    mname = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][month-1]
-
-    month_sigs = [s for s in signal_history if s.get("month") == month and s.get("year") == year]
-
-    total  = len(month_sigs)
-    wins   = len([s for s in month_sigs if s.get("result") == "win"])
-    losses = len([s for s in month_sigs if s.get("result") == "loss"])
-    wr     = round(wins / total * 100) if total > 0 else 0
-    pnl    = sum(s.get("pnl", 0) for s in month_sigs)
-
-    xau_sigs = [s for s in month_sigs if s["asset"] == "XAUUSD"]
-    btc_sigs = [s for s in month_sigs if s["asset"] == "BTCUSD"]
-    xau_wr   = round(len([s for s in xau_sigs if s.get("result")=="win"]) / len(xau_sigs) * 100) if xau_sigs else 0
-    btc_wr   = round(len([s for s in btc_sigs if s.get("result")=="win"]) / len(btc_sigs) * 100) if btc_sigs else 0
-
-    # Session breakdown
-    sess_map = {}
-    for s in month_sigs:
-        sess = s.get("session", "Unknown")
-        if sess not in sess_map:
-            sess_map[sess] = {"w": 0, "l": 0}
-        if s.get("result") == "win":
-            sess_map[sess]["w"] += 1
-        else:
-            sess_map[sess]["l"] += 1
-
-    best_sess  = max(sess_map.items(), key=lambda x: x[1]["w"]/max(x[1]["w"]+x[1]["l"],1), default=None)
-    worst_sess = min(sess_map.items(), key=lambda x: x[1]["w"]/max(x[1]["w"]+x[1]["l"],1), default=None)
-
-    # Avg RR
-    win_sigs = [s for s in month_sigs if s.get("result") == "win"]
-    avg_rr   = round(sum(s.get("rr", 0) for s in win_sigs) / max(len(win_sigs), 1), 1)
-
-    # Avg score
-    avg_score = round(sum(s.get("score", 0) for s in month_sigs) / max(total, 1))
-
-    # Grade
-    grade = "A+" if wr >= 80 else "A" if wr >= 70 else "B+" if wr >= 60 else "B" if wr >= 50 else "C"
-
-    # Edges
-    edges = []
-    if wr >= 70:
-        edges.append("Strategy edge confirmed - " + str(wr) + "% win rate!")
-    if avg_rr >= 3:
-        edges.append("Good RR management - avg 1:" + str(avg_rr))
-    if best_sess:
-        bwr = round(best_sess[1]["w"] / max(best_sess[1]["w"]+best_sess[1]["l"], 1) * 100)
-        edges.append("Best session: " + best_sess[0] + " (" + str(bwr) + "% WR)")
-    if not edges:
-        edges.append("Work on improving entry quality")
-
-    # Improvements
-    improvements = []
-    if wr < 70:
-        improvements.append("Increase min score threshold to 75%+")
-    if avg_rr < 3:
-        improvements.append("Hold trades longer to hit TP2")
-    if worst_sess:
-        wwr = round(worst_sess[1]["w"] / max(worst_sess[1]["w"]+worst_sess[1]["l"], 1) * 100)
-        if wwr < 50:
-            improvements.append("Avoid " + worst_sess[0] + " - only " + str(wwr) + "% WR")
-    improvements.append("Focus on Tue-Wed Overlap for best results")
-
-    lines = [
-        "ðŸ“Š MONTHLY PERFORMANCE REPORT",
-        mname + " " + str(year),
-        "=" * 24,
-        "ðŸ“Š Total Signals : " + str(total),
-        "âœ… Wins         : " + str(wins),
-        "âŒ Losses       : " + str(losses),
-        "ðŸŽ¯ Win Rate     : " + str(wr) + "%",
-        "ðŸ’° Net P&L      : " + ("+" if pnl >= 0 else "") + "$" + str(round(pnl, 1)),
-        "ðŸ“ Avg RR       : 1:" + str(avg_rr),
-        "ðŸ“Š Avg Score    : " + str(avg_score) + "%",
-        "ðŸ† Grade        : " + grade,
-        "=" * 24,
-        "âš¡ XAUUSD  : " + str(len(xau_sigs)) + " signals | " + str(xau_wr) + "% WR",
-        "â‚¿ BTCUSDT : " + str(len(btc_sigs)) + " signals | " + str(btc_wr) + "% WR",
-        "=" * 24,
-        "ðŸ’¡ EDGES FOUND:",
-    ] + ["âœ” " + e for e in edges] + [
-        "=" * 24,
-        "ðŸ“ˆ IMPROVEMENTS:",
-    ] + ["ðŸ”¸ " + i for i in improvements] + [
-        "=" * 24,
-        "ðŸ“ SESSION BREAKDOWN:",
-    ] + ["â€¢ " + k + ": " + str(v["w"]) + "W/" + str(v["l"]) + "L" for k, v in sess_map.items()] + [
-        "=" * 24,
-        wr >= 70 and "ðŸ”¥ Outstanding month! Strategy is working!" or
-        wr >= 50 and "ðŸ’ª Decent month! Keep improving!" or
-        "ðŸ’¡ Challenging month - review and adapt!",
-        "=" * 24,
-        "ðŸ“¢ @Alphagoldsigna",
-        "ðŸ¤– Alpha Agent v5.0",
-    ]
-    return "\n".join(lines)
-
-# =======================================
-# CHECK WEEKLY + MONTHLY REPORTS
-# =======================================
-def check_periodic_reports():
-    global weekly_report_sent, monthly_report_sent
-    global last_week_num, last_month_num
-
-    now   = datetime.datetime.utcnow()
-    # Convert to IST
-    ist   = now + datetime.timedelta(hours=5, minutes=30)
-
-    week  = now.isocalendar()[1]
-    month = now.month
-
-    # WEEKLY: Send every Sunday at 8:00 PM IST = 14:30 GMT
-    # weekday(): Monday=0, Sunday=6
-    if ist.weekday() == 6 and ist.hour == 20 and ist.minute < 10:
-        if last_week_num != week:
-            log("Sending weekly performance report...", "INFO")
-            msg = build_weekly_report()
-            if send(msg):
-                last_week_num      = week
-                weekly_report_sent = True
-                log("Weekly report sent!", "SUCCESS")
-
-    # MONTHLY: Send on 1st of every month at 9:00 AM IST = 3:30 GMT
-    if ist.day == 1 and ist.hour == 9 and ist.minute < 10:
-        if last_month_num != month:
-            log("Sending monthly performance report...", "INFO")
-            msg = build_monthly_report()
-            if send(msg):
-                last_month_num      = month
-                monthly_report_sent = True
-                log("Monthly report sent!", "SUCCESS")
+def run_scan(label=""):
+    global sig_count
+    log("=== SCAN " + label + " ===")
+    for asset_key in ASSETS:
+        try:
+            data = analyze(asset_key)
+            if not data:
+                log(asset_key + " - No setup")
+                continue
+            log(asset_key + " | " + data["trend"] + " | Score:" + str(data["score"]) + "% | $" + str(data["entry"]))
+            if data["score"] >= MIN_SCORE:
+                now_t = time.time()
+                if now_t - last_signal[asset_key] > COOLDOWN_HOURS * 3600:
+                    if send(build_signal(data)):
+                        last_signal[asset_key] = now_t
+                        sig_count += 1
+                        trade_id = asset_key + "_" + str(int(now_t))
+                        active_trades[trade_id] = {
+                            "asset":   asset_key,
+                            "trend":   data["trend"],
+                            "entry":   data["entry"],
+                            "sl_p":    data["sl_p"],
+                            "tp1":     data["tp1"],
+                            "tp2":     data["tp2"],
+                            "tp3":     data["tp3"],
+                            "sl_amt":  data["sl_amt"],
+                            "tp1_hit": False,
+                            "tp2_hit": False,
+                            "tp3_hit": False,
+                        }
+                        dt = datetime.datetime.utcnow()
+                        signal_history.append({
+                            "asset":   asset_key, "trend": data["trend"],
+                            "entry":   data["entry"], "score": data["score"],
+                            "session": data["session"]["name"],
+                            "result":  "pending", "pnl": 0,
+                            "week":    dt.isocalendar()[1],
+                            "month":   dt.month, "year": dt.year,
+                        })
+                        log("Signal #" + str(sig_count) + " sent + TP/SL tracking!", "SUCCESS")
+                else:
+                    rem = int((COOLDOWN_HOURS * 3600 - (time.time() - last_signal[asset_key])) / 60)
+                    log(asset_key + " cooldown: " + str(rem) + "min")
+            else:
+                failed = [c["label"] for c in data["checks"] if not c["pass"]]
+                log(asset_key + " " + str(data["score"]) + "% | Failed: " + ", ".join(failed[:3]))
+            time.sleep(2)
+        except Exception as e:
+            log(asset_key + " error: " + str(e), "ERROR")
 
 # =======================================
 # STARTUP
 # =======================================
 def startup():
     send("\n".join([
-        "\U0001f916 Alpha Auto Agent v6.0 LIVE! \U0001f680",
+        "\U0001f916 Alpha Auto Agent v5.1 LIVE! \U0001f680",
         "",
-        "\u2705 XAUUSD + BTCUSDT Real Data",
-        "\u2705 MTF Trend Daily+4H+1H",
-        "\u2705 TP1/TP2/TP3 + SL Alerts",
-        "\u2705 Morning View 9:00 AM IST",
-        "\u2705 Evening View 6:00 PM IST",
-        "\u2705 Weekly Report - Sunday 8PM IST",
-        "\u2705 Monthly Report - 1st of Month",
-        "\u2705 Edges + Insights Auto Analysis",
-        "\u2705 News Filter Active",
+        "\u2705 Gold: Twelve Data + Yahoo (Real)",
+        "\u2705 BTC: Binance + Bybit + Yahoo + TD",
+        "\u2705 API calls: Max 4/min (FIXED!)",
+        "\u2705 TP1 + TP2 + TP3 + SL Alerts",
         "",
-        "\u23f1 Scan: Every 5 min",
-        "\U0001f4af Min Score: 70%+",
+        "\U0001f4cb SCHEDULE (IST):",
+        "\U0001f31e 9:00 AM    - Morning View + News",
+        "\U0001f525 12:30 PM   - Prime Time START",
+        "\U0001f50d Every 15min - Signal Scan",
+        "\U0001f307 6:00 PM    - Evening View + News",
+        "\U0001f50d Continue   - 15min scans till 10:30 PM",
+        "\U0001f4ca Sunday 8PM - Weekly Report",
+        "\U0001f4ca 1st Month  - Monthly Report",
         "",
+        "\U0001f3af Min Score: 60%+",
+        "\u23f0 Cooldown: 2hr per asset",
         "\U0001f4e2 @Alphagoldsigna",
-        "Let's make money! \U0001f4b0\U0001f525",
+        "Let's go! \U0001f4b0\U0001f525",
     ]))
 
 # =======================================
 # MAIN LOOP
 # =======================================
 def main():
-    global scan_count, sig_count
+    global last_scan_time
     log("=" * 40)
-    log("ALPHA AUTO AGENT v5.0 STARTING")
+    log("ALPHA AUTO AGENT v5.1 STARTING")
+    log("API calls fixed: Max 4/min")
+    log("Gold cache: 55min | BTC cache: 14min")
+    log("Prime Time: 12:30PM-10:30PM IST | 15min scan")
     log("=" * 40)
     startup()
 
     while True:
-        scan_count += 1
-        log(f"=== SCAN #{scan_count} ===")
+        try:
+            reset_daily()
+            ist   = get_ist()
+            h, m  = ist.hour, ist.minute
+            now_t = time.time()
 
-        # Check morning/evening view
-        check_and_send_market_view()
+            # 9:00 AM - Morning View
+            if h == 9 and m < 5 and "morning" not in sent_today:
+                send(build_view("morning"))
+                sent_today["morning"] = True
+                news = [n for n in get_todays_news() if n["impact"] == "High"]
+                if news: send(build_news_alert(news))
+                sent_today["morning_news"] = True
+                log("Morning view sent!")
 
-        # Check weekly/monthly reports
-        check_periodic_reports()
+            # 6:00 PM - Evening View
+            elif h == 18 and m < 5 and "evening" not in sent_today:
+                send(build_view("evening"))
+                sent_today["evening"] = True
+                news = [n for n in get_todays_news() if n["impact"] == "High"]
+                if news: send(build_news_alert(news))
+                sent_today["evening_news"] = True
+                log("Evening view sent!")
 
-        # Check TP/SL hits for active trades
-        check_tp_sl_hits()
+            # Sunday 8PM - Weekly Report
+            elif ist.weekday() == 6 and h == 20 and m < 5 and "weekly" not in sent_today:
+                send(build_weekly())
+                sent_today["weekly"] = True
+                log("Weekly report sent!")
 
-        # Signal scan
-        sess = get_session()
-        if not sess["good"]:
-            log(f"Session: {sess['name']} - Waiting...")
-            time.sleep(SCAN_INTERVAL_MIN * 60)
-            continue
+            # 1st of Month 9AM - Monthly Report
+            elif ist.day == 1 and h == 9 and 5 <= m < 10 and "monthly" not in sent_today:
+                send(build_monthly())
+                sent_today["monthly"] = True
+                log("Monthly report sent!")
 
-        for asset_key in ASSETS:
-            try:
-                data = analyze(asset_key)
-                if not data:
-                    log(f"{asset_key} - No setup")
-                    continue
-
-                log(f"{asset_key} | {data['trend']} | "
-                    f"MTF:{data['mtf_trend']} | "
-                    f"Score:{data['score']}% | "
-                    f"Price:{data['entry']}")
-
-                if data["score"] >= MIN_SCORE:
-                    now = time.time()
-                    if now - last_signal[asset_key] > COOLDOWN_HOURS * 3600:
-                        if send(build_msg(data)):
-                            last_signal[asset_key] = now
-                            sig_count += 1
-                            # Track trade for TP/SL alerts
-                            trade_id = f"{asset_key}_{int(now)}"
-                            active_trades[trade_id] = {
-                                "asset":   asset_key,
-                                "trend":   data["trend"],
-                                "entry":   data["entry"],
-                                "sl_p":    data["sl_p"],
-                                "tp1":     data["tp1"],
-                                "tp2":     data["tp2"],
-                                "tp3":     data["tp3"],
-                                "sl_amt":  data["sl_amt"],
-                                "tp1_hit": False,
-                                "tp2_hit": False,
-                            }
-                            # Track for performance reports
-                            dt_now = datetime.datetime.utcnow()
-                            signal_history.append({
-                                "asset":   asset_key,
-                                "trend":   data["trend"],
-                                "entry":   data["entry"],
-                                "score":   data["score"],
-                                "session": data["session"]["name"],
-                                "result":  "pending",
-                                "pnl":     0,
-                                "rr":      0,
-                                "week":    dt_now.isocalendar()[1],
-                                "month":   dt_now.month,
-                                "year":    dt_now.year,
-                                "trade_id": trade_id,
-                            })
-                            # Keep only last 500 signals
-                            if len(signal_history) > 500:
-                                signal_history.pop(0)
-                            log(f"Signal #{sig_count} sent + tracking started!", "SUCCESS")
-                    else:
-                        rem = int((COOLDOWN_HOURS*3600-(now-last_signal[asset_key]))/60)
-                        log(f"{asset_key} cooldown: {rem}min left")
+            # Prime Time - Har 15 min scan + TP/SL check
+            if is_prime_time():
+                check_tp_sl()
+                if now_t - last_scan_time >= 15 * 60:
+                    sess  = get_session()
+                    label = str(h) + ":" + str(m).zfill(2) + " IST | " + sess["name"]
+                    run_scan(label)
+                    last_scan_time = now_t
                 else:
-                    failed = [c["label"] for c in data["checks"] if not c["pass"]]
-                    log(f"{asset_key} score {data['score']}% | "
-                        f"Failed: {', '.join(failed[:3])}")
+                    rem = int((15 * 60 - (now_t - last_scan_time)) / 60)
+                    log("IST " + str(h) + ":" + str(m).zfill(2) +
+                        " | Next scan: " + str(rem) + "min | Signals: " + str(sig_count))
+            else:
+                if active_trades:
+                    check_tp_sl()
+                log("IST " + str(h) + ":" + str(m).zfill(2) +
+                    " | Not prime time | Signals: " + str(sig_count))
 
-                time.sleep(3)
+        except Exception as e:
+            log("Main loop error: " + str(e), "ERROR")
 
-            except Exception as e:
-                log(f"{asset_key} error: {e}", "ERROR")
-                continue
-
-        log(f"=== Scan #{scan_count} done | Signals:{sig_count} ===")
-        time.sleep(SCAN_INTERVAL_MIN * 60)
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
